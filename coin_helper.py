@@ -23,13 +23,14 @@ MGAME = "com.sankuai.meituan"
 MGAME_MAIN = MGAME + "/com.meituan.android.pt.homepage.activity.MainActivity"
 APP_LOCK = "com.miui.securitycenter"
 PROMO_ACTIVITY = "com.meituan.android.knb.core.StandardKnbActivity"
+PROMO_SEARCH = MGAME + ".search.result.SearchResultActivity"
 PROMO_WEBVIEW = "com.sankuai.titans.adapter.mtapp.KNBWebViewActivity"
 PROMO_LIVE = "com.dianping.live.live.mrn.MLiveMRNActivity"
 PROMO_GROUP = "com.meituan.android.mtgb.business.main.MTGMainActivity"
 PROMO_ATTRACTION = "com.meituan.traveltools.mrncontainer.HTMRNBaseActivity"
 AD_WEBVIEW = "com.ubix.ssp.open.comm.UBiXWebViewActivity"
 PROMO_EXTERNAL_APPS = {"com.dianping.v1"}
-GOODS_EXTERNAL_APPS = {"com.qiyi.video", "com.UCMobile"}
+GOODS_EXTERNAL_APPS = {"com.qiyi.video", "com.UCMobile", "com.tencent.qqlive", "com.jingdong.app.mall"}
 GAME_ACTIVITY = "com.meituan.android.mgc.container.MGCGameActivity"
 GAME_AD = "com.windmill.sdk.widget.InterstitialView_4012001"
 GAME_AD_COMPACT = "com.windmill.sdk.widget.InterstitialView_4012003"
@@ -361,12 +362,17 @@ def read_progress(image, vision, trace, label):
     snippet = crop(image, (right + inset, top - 4, min(right + 175, 820), bottom + 4))
     path = trace.directory / f"progress-{label}.png"
     gray = cv2.cvtColor(snippet, cv2.COLOR_BGR2GRAY)
+    blue, green, red = cv2.split(snippet)
+    # The orange task decoration can overlap a dark progress digit.
+    tinted = (red.astype(np.int16) - blue > 45) & (green.astype(np.int16) - blue > 12)
+    gray[tinted] = 255
     enlarged = cv2.resize(gray, None, fx=3, fy=3, interpolation=cv2.INTER_CUBIC)
     _, binary = cv2.threshold(enlarged, 0, 255, cv2.THRESH_BINARY | cv2.THRESH_OTSU)
     padded = cv2.copyMakeBorder(binary, 20, 20, 20, 20, cv2.BORDER_CONSTANT, value=255)
     output = read_ocr(trace, padded, path.name)
     values = re.findall(r"(?<!\d)(\d{1,2})\s*[/／]\s*(\d{1,2})(?!\d)", output)
-    if vision.task.key == "promo" and not values:
+    values = [value for value in values if 0 <= int(value[0]) <= int(value[1]) <= 30 and int(value[1]) > 0]
+    if not values:
         points = cv2.findNonZero(255 - binary)
         if points is not None:
             x, y, width, height = cv2.boundingRect(points)
@@ -376,6 +382,7 @@ def read_progress(image, vision, trace, label):
                 retry = cv2.copyMakeBorder(resized, 30, 30, 30, 30, cv2.BORDER_CONSTANT, value=255)
                 output = read_ocr(trace, retry, f"progress-{label}-retry-{scale}.png")
                 values = re.findall(r"(?<!\d)(\d{1,2})\s*[/／]\s*(\d{1,2})(?!\d)", output)
+                values = [value for value in values if 0 <= int(value[0]) <= int(value[1]) <= 30 and int(value[1]) > 0]
                 if len(values) == 1:
                     break
     if len(values) != 1:
@@ -471,7 +478,7 @@ def wait_for_page(phone, vision, wanted, timeout=10, trace=None, *, settling=Fal
         state, box = observe(image, vision, trace)
         if state == "unknown" and "promo_landing" in wanted:
             component = phone.foreground_component()
-            if component == [MGAME, PROMO_ACTIVITY] or (
+            if component in ([MGAME, PROMO_ACTIVITY], [MGAME, PROMO_SEARCH]) or (
                 component == [MGAME, PROMO_GROUP]
                 and vision.match(image, "promo_group_home", (80, 115, 550, 210))
             ):
@@ -579,18 +586,24 @@ def browse_external(phone, vision, trace):
         if package in landing_apps or package == APP_LOCK:
             break
         if package and package != MGAME:
+            # An app protected by the OS can appear briefly before its lock screen.
+            time.sleep(3)
+            if phone.foreground() == APP_LOCK:
+                package = APP_LOCK
+                break
             raise Stop(f"广告跳转到未验证的应用 {package}，请手动返回Mgame。")
         time.sleep(0.4)
     else:
         raise Stop("未确认落地应用，无法开始计时。")
     trace.record("landing", package=package)
-    if package == APP_LOCK:
-        trace.record("app_lock_return")
-    else:
+    if package != APP_LOCK:
         until = time.monotonic() + vision.task.seconds + 2
         last_allowed = time.monotonic()
         while time.monotonic() < until:
             foreground = phone.foreground()
+            if foreground == APP_LOCK:
+                package = APP_LOCK
+                break
             if foreground == package:
                 last_allowed = time.monotonic()
             elif foreground in landing_apps:
@@ -601,8 +614,10 @@ def browse_external(phone, vision, trace):
             elif foreground is not None or time.monotonic() - last_allowed > 1.5:
                 raise Stop(f"浏览期间前台应用变化：{foreground}。")
             time.sleep(0.35)
-        if phone.foreground() != package:
+        if package != APP_LOCK and phone.foreground() != package:
             raise Stop("计时结束时广告落地页不在前台。")
+    if package == APP_LOCK:
+        trace.record("app_lock_return")
     phone.return_to_mgame()
     return package == APP_LOCK
 
@@ -642,7 +657,7 @@ def browse_one(phone, vision, trace, before, progress):
 
 
 def close_promo_live(phone, vision, trace):
-    for _ in range(3):
+    for _ in range(4):
         if phone.foreground_component() != [MGAME, PROMO_LIVE]:
             return
         image = phone.frame()
@@ -655,9 +670,9 @@ def close_promo_live(phone, vision, trace):
             break
         phone.tap(center(close))
         trace.record("live_closed", target="follow_popup" if follow else "room", point=center(close))
-        if not follow:
-            return
-        time.sleep(0.5)
+        time.sleep(0.75)
+    if phone.foreground_component() != [MGAME, PROMO_LIVE]:
+        return
     raise Stop("无法确认直播页关闭按钮。")
 
 
@@ -673,7 +688,7 @@ def browse_promo_page(phone, vision, trace, *, page="promo_landing"):
             on_page = phone.foreground_component() == [MGAME, activity]
         else:
             component = phone.foreground_component()
-            on_page = component == [MGAME, PROMO_ACTIVITY] or (
+            on_page = component in ([MGAME, PROMO_ACTIVITY], [MGAME, PROMO_SEARCH]) or (
                 component == [MGAME, PROMO_GROUP]
                 and vision.match(phone.frame(), "promo_group_home", (80, 115, 550, 210))
             ) or vision.identify(phone.frame())[0] == "promo_landing"
@@ -794,6 +809,7 @@ TIMED_PLAYERS = {
     "watch60": ("com.meituan.android.novel.library.page.video.stream.NovelVideoActivity",
                 MGAME + ".msv.page.activity.MSVPageActivity"),
 }
+NOVEL_LIBRARY = "com.meituan.android.mrnx.container.MRNXStandardActivity"
 
 
 def browse10_rows(vision, image, rule="browse10"):
@@ -1097,6 +1113,8 @@ def browse10_landing(phone, vision, trace):
                 image, "browse10_review", (380, 122, 710, 216)
             )
             if (monthly or review or vision.identify(image)[0] == "promo_landing"
+                or (component == [MGAME, PROMO_GROUP]
+                    and vision.match(image, "promo_group_home", (80, 115, 550, 210)))
                 or component == [MGAME, MGAME + ".msv.page.activity.MSVPageActivity"]
                 or (component == [MGAME, "com.meituan.msc.modules.container.MSCActivity"]
                     and vision.match(image, "browse10_merchant", (398, 120, 690, 212)))
@@ -1181,42 +1199,45 @@ def timed_media(phone, vision, trace, rule):
     phone.back()
     if listening:
         leave_novel_audio(phone, vision)
-    else:
-        for _ in range(2):
-            time.sleep(1)
-            if phone.foreground_component() not in players:
-                break
-            phone.back()
+    leave_drama(phone)
     return game60_panel(phone, vision, trace)
 
 
-def start_novel_audio(phone, vision):
-    image = phone.frame()
-    if vision.match(image, "listen30_popup", (133, 475, 845, 566)):
-        close = vision.match(image, "listen30_popup_close", (874, 480, 942, 558))
-        if close is None:
-            raise Stop("未识别听书签到浮层的关闭按钮。")
-        phone.tap(center(close))
-        time.sleep(0.7)
-        image = phone.frame()
+def leave_drama(phone):
+    for _ in range(3):
+        time.sleep(1)
+        package, activity = phone.foreground_component()
+        if package != MGAME or activity not in TIMED_PLAYERS["watch60"]:
+            return
+        phone.back()
 
+
+def start_novel_audio(phone, vision):
     pause_region = (156, 1905, 243, 2027)
-    if vision.match(image, "listen30_pause", pause_region):
-        return
-    if not vision.match(image, "listen30_page_audio", (798, 1880, 1045, 1982)):
-        # Tap a plain part of the reader only when it has the observed paper color.
-        paper = crop(image, (510, 1138, 554, 1189))
-        if np.mean(np.max(np.abs(paper.astype(np.int16) - [196, 215, 220]), axis=2) < 22) < 0.65:
-            raise Stop("当前阅读区有其他内容，未能安全唤出听书控制。")
-        phone.tap((531, 1164))
-        time.sleep(0.6)
+    audio_region = (798, 1880, 1045, 1982)
+    ui_deadline = time.monotonic() + 8
+    while time.monotonic() < ui_deadline:
         image = phone.frame()
-    if vision.match(image, "listen30_pause", pause_region):
-        return
-    start = vision.match(image, "listen30_page_audio", (798, 1880, 1045, 1982))
-    if start is None:
-        raise Stop("未识别「听当前页」按钮。")
-    phone.tap(center(start))
+        if vision.match(image, "listen30_popup", (133, 475, 845, 566)):
+            close = vision.match(image, "listen30_popup_close", (874, 480, 942, 558))
+            if close:
+                phone.tap(center(close))
+        elif vision.match(image, "listen30_pause", pause_region):
+            return
+        else:
+            start = vision.match(image, "listen30_page_audio", audio_region)
+            if start:
+                phone.tap(center(start))
+                break
+            # Find an unobstructed paper patch near the center of the reader.
+            for x, y in ((531, 1164), (531, 1040), (531, 1280), (531, 1400)):
+                pixels = crop(image, (x - 18, y - 18, x + 18, y + 18)).astype(np.int16)
+                if np.mean(np.max(np.abs(pixels - [196, 215, 220]), axis=2) < 22) >= 0.80:
+                    phone.tap((x, y))
+                    break
+        time.sleep(0.75)
+    else:
+        raise Stop("未确认听书控件，无法开始播放。")
     deadline = time.monotonic() + 6
     while time.monotonic() < deadline:
         if vision.match(phone.frame(), "listen30_pause", pause_region):
@@ -1226,10 +1247,13 @@ def start_novel_audio(phone, vision):
 
 
 def leave_novel_audio(phone, vision):
-    library = [MGAME, "com.sankuai.meituan.android.mrnx.container.MRNXStandardActivity"]
-    for _ in range(2):
-        time.sleep(0.8)
-        if phone.foreground_component() != library:
+    deadline = time.monotonic() + 12
+    while time.monotonic() < deadline:
+        component = phone.foreground_component()
+        if component == [MGAME, TIMED_PLAYERS["listen30"][0]] or component[0] is None:
+            time.sleep(0.5)
+            continue
+        if component != [MGAME, NOVEL_LIBRARY]:
             return
         image = phone.frame()
         if vision.match(image, "listen30_library", (82, 124, 351, 216)):
@@ -1239,13 +1263,22 @@ def leave_novel_audio(phone, vision):
                 time.sleep(0.4)
             phone.back()
             return
-        phone.back()
+        if vision.match(image, "listen30_preview", (300, 1760, 778, 1910)):
+            phone.back()
+            time.sleep(1.2)
+        else:
+            time.sleep(0.5)
+    raise Stop("未能确认小说章节预览或书库的返回入口。")
 
 
 def finish_browse10(phone, vision, trace, rule="browse10"):
-    if rule in TIMED_PLAYERS and phone.foreground_component() in [[MGAME, activity] for activity in TIMED_PLAYERS[rule]]:
+    component = phone.foreground_component() if rule in TIMED_PLAYERS else None
+    if rule in TIMED_PLAYERS and component in [[MGAME, activity] for activity in TIMED_PLAYERS[rule]]:
         image = timed_media(phone, vision, trace, rule)
     else:
+        if rule == "listen30" and component == [MGAME, NOVEL_LIBRARY]:
+            leave_novel_audio(phone, vision)
+            leave_drama(phone)
         image = game60_panel(phone, vision, trace)
     completed = []
     for index in range(20):
