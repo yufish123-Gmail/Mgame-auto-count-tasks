@@ -1,0 +1,9 @@
+/.venv/
+__pycache__/
+*.py[cod]
+/runs/
+/session.lock
+/.env*
+*.log
+*.png
+!/templates/*.png
