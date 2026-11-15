@@ -40,4 +40,4 @@ python -m venv .venv
 powershell -NoProfile -ExecutionPolicy Bypass -File .\run.ps1 -ReturnMgame
 ```
 
-给下一位 Codex 或其他 Agent 的说明见 [交接说明](交接说明.md)。
+给下一位 Codex 或其他 Agent 的操作指南见 [Agent.md](Agent.md)，历史实测和阶段规则见 [交接说明](交接说明.md)。
