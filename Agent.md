@@ -24,5 +24,5 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\run.ps1 -Task all -Execute
 - [coin_helper.py](coin_helper.py) 中的 `run_stages` 固定顺序。三个重复浏览任务在 `finish_task`，60 秒游戏在 `finish_games`，其余计时任务在 `finish_browse10` 和 `timed_media`。启动参数由 [run.ps1](run.ps1) 转发，界面模板在 `templates/`，Windows OCR 在 `read-progress.ps1`。
 - 保留原任务的识别依据。浏览奖励按小字匹配。同一行出现下单奖励时，只处理浏览部分。短剧和听书在播放页计时。领奖前核对同一行的「可领奖」，领奖后核对实际次数增加。
 - 遇到陌生页面时，用当前截图和前台活动确认页面类型与退出控件。若卡在广告或其他应用，先等当前运行停止，再用 `-ReturnMgame` 返回 Mgame 主界面。重新进入「加次数」后按实际进度续跑。
-- 每次运行查看 `runs/<运行编号>/events.jsonl`。用 `stage_started` 找到出错阶段，用 `stopped` 看原因。以 `task_complete`、`game60_confirmed` 或 `timed_confirmed` 结合手机页面核对结算。`stage_finished` 也可能表示扫描后跳过该阶段。
+- 每次运行查看 `runs/<运行编号>/events.jsonl`。用 `stage_started` 找到出错阶段，用 `stopped` 或 `ad_recovery` 看原因。日志里的 `screenshot` 事件指向程序保存的截图，`screenshot_unavailable` 表示该画面未能保存。以 `task_complete`、`game60_confirmed` 或 `timed_confirmed` 结合截图核对结算。`stage_finished` 的 `elapsed_seconds` 可用于比较同阶段耗时，该事件也可能表示扫描后跳过。
 - 提交前检查 `git diff --check`。代码有变化时先跑 Python 语法检查，再验证改动涉及的阶段。回测报告写明完成进度、实际到账次数、人工介入和日志路径。保留提交所需的局部模板，运行日志、完整截图和本机环境由 `.gitignore` 排除。
