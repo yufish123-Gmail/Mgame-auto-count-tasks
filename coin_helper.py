@@ -31,7 +31,7 @@ PROMO_GROUP = "com.meituan.android.mtgb.business.main.MTGMainActivity"
 PROMO_ATTRACTION = "com.meituan.traveltools.mrncontainer.HTMRNBaseActivity"
 AD_WEBVIEW = "com.ubix.ssp.open.comm.UBiXWebViewActivity"
 PROMO_EXTERNAL_APPS = {"com.dianping.v1"}
-GOODS_EXTERNAL_APPS = {"com.qiyi.video", "com.UCMobile", "com.tencent.qqlive"}
+GOODS_EXTERNAL_APPS = {"com.qiyi.video", "com.UCMobile", "com.tencent.qqlive", "com.ss.android.ugc.aweme"}
 GAME_ACTIVITY = "com.meituan.android.mgc.container.MGCGameActivity"
 GAME_AD = "com.windmill.sdk.widget.InterstitialView_4012001"
 GAME_AD_COMPACT = "com.windmill.sdk.widget.InterstitialView_4012003"
@@ -485,16 +485,22 @@ def is_ranked_promo(image, trace):
     return bool(re.search(r"好评榜|人气榜|热销榜|排行榜", re.sub(r"\s+", "", title)))
 
 
-def close_ad_error(phone, vision, image, trace):
+def close_ad_webview(phone, vision, image, trace):
     if phone.foreground_component() != [MGAME, AD_WEBVIEW]:
         return False
-    if not vision.match(image, "ad_web_error", (340, 112, 744, 233)):
+    header = (340, 112, 745, 233)
+    if vision.match(image, "ad_web_error", header):
+        state = "ad-web-error"
+    elif vision.match(image, "ad_web_store", header, 0.88):
+        state = "ad-web-store"
+    else:
         return False
     close = vision.match(image, "ad_web_close", (150, 112, 263, 228))
     if close is None:
         return False
     phone.tap(center(close))
-    trace.record("ad_error_closed", point=center(close))
+    trace.record("ad_webview_closed", state=state, point=center(close))
+    trace.snapshot(phone, state, image=image, component=[MGAME, AD_WEBVIEW])
     return True
 
 
@@ -502,12 +508,20 @@ def wait_for_page(phone, vision, wanted, timeout=10, trace=None, *, settling=Fal
     deadline = time.monotonic() + timeout
     state = "unknown"
     entry_failed = False
-    closed_error = False
+    closed_webview = False
+    returned_from_lock = False
     while time.monotonic() < deadline:
         try:
             image = phone.frame()
         except ForegroundChanged:
-            if "promo_landing" in wanted and phone.foreground() in PROMO_EXTERNAL_APPS:
+            package = phone.foreground()
+            if settling and package == APP_LOCK and not returned_from_lock:
+                trace.snapshot(phone, "settling-app-lock")
+                phone.return_to_mgame()
+                returned_from_lock = True
+                wanted = wanted | {"ad"}
+                deadline = time.monotonic() + timeout
+            if "promo_landing" in wanted and package in PROMO_EXTERNAL_APPS:
                 return None, "promo_external", None
             time.sleep(0.45)
             continue
@@ -544,9 +558,9 @@ def wait_for_page(phone, vision, wanted, timeout=10, trace=None, *, settling=Fal
                 return image, "promo_rank", None
         if state in wanted:
             return image, state, box
-        if state == "unknown" and settling and not closed_error:
-            closed_error = close_ad_error(phone, vision, image, trace)
-            if closed_error:
+        if state == "unknown" and settling and not closed_webview:
+            closed_webview = close_ad_webview(phone, vision, image, trace)
+            if closed_webview:
                 deadline = time.monotonic() + timeout
         time.sleep(0.45)
     if entry_failed:
@@ -664,6 +678,24 @@ def browse_external(phone, vision, trace):
             raise LandingUnconfirmed("计时结束时广告落地页不在前台。")
     if package == APP_LOCK:
         trace.record("app_lock_return")
+    elif package == "com.tencent.qqlive":
+        try:
+            image = phone.capture()
+        except CaptureUnavailable as exc:
+            trace.record("screenshot_unavailable", state="external-return", reason=str(exc))
+            image = None
+        button = (vision.match(image, "ad_external_return", (0, 1770, 406, 2290), 0.88)
+                  if image is not None else None)
+        if button:
+            component = phone.foreground_component()
+            if component[0] == package:
+                phone.adb_call("shell", "input", "tap", *map(str, center(button)))
+                trace.snapshot(phone, "external-return", image=image, component=component)
+                deadline = time.monotonic() + 3
+                while time.monotonic() < deadline:
+                    if phone.foreground() == MGAME:
+                        return False
+                    time.sleep(0.35)
     phone.return_to_mgame()
     return package == APP_LOCK
 
@@ -691,6 +723,7 @@ def browse_one(phone, vision, trace, before, progress):
         settling=True,
     )
     if state == "ad":
+        trace.snapshot(phone, "blocked-ad", image=after)
         dismiss_ad(phone, vision, trace)
         wait_for_page(phone, vision, {"task", "task_unavailable", "list"})
         trace.record("blocked_ad_retry", task=vision.task.key)
@@ -789,14 +822,16 @@ def recover_ad_round(phone, vision, trace, failure):
     else:
         image = phone.frame()
         state, _ = observe(image, vision, trace)
-        if state == "unknown" and not close_ad_error(phone, vision, image, trace):
+        if state == "unknown" and not close_ad_webview(phone, vision, image, trace):
             phone.back()
     targets = {"coins", "profile", "list", "task", "task_unavailable", "ad", "reward", "reward_final"}
     try:
-        _, state, _ = wait_for_page(phone, vision, targets, timeout=6, trace=trace, settling=True)
+        image, state, _ = wait_for_page(phone, vision, targets, timeout=6, trace=trace, settling=True)
     except LandingUnconfirmed:
         phone.recover_mgame_main(vision, trace)
+        trace.snapshot(phone, "ad-recovered-main")
         return None
+    trace.snapshot(phone, "ad-recovered-" + state, image=image)
     if state == "ad":
         dismiss_ad(phone, vision, trace)
         image, state, _ = wait_for_page(phone, vision, targets - {"ad"}, timeout=6)
@@ -1115,6 +1150,9 @@ def return_game60_panel(phone, vision, trace):
                 return game60_panel(phone, vision, trace)
             if component == [MGAME, GAME_AD_COMPACT]:
                 raise Stop("切回后仍显示飞猪插屏。")
+            if (component == [MGAME, GAME_ACTIVITY] and
+                vision.match(image, "game60_update_prompt", (140, 1020, 950, 1220), 0.92)):
+                raise Stop("游戏显示更新提示，改从Mgame主界面恢复。")
             if not back_sent and component in GAME_COMPONENTS and phone.foreground_component() == component:
                 phone.back()
                 trace.record("game60_back", activity=component[1])
@@ -1129,9 +1167,12 @@ def return_game60_panel(phone, vision, trace):
     if phone.foreground_component() != [MGAME, GAME_ACTIVITY]:
         raise Stop("切回Mgame后未能返回游戏任务列表。")
     image = phone.frame()
-    button = vision.match(image, "game60_exit", (925, 25, 1079, 210), 0.88)
+    button = (vision.match(image, "game60_exit", (925, 25, 1079, 210), 0.88)
+              or vision.match(image, "game60_exit_capsule", (925, 25, 1079, 175), 0.90))
     if not button:
         raise Stop("未识别到小游戏的退出按钮。")
+    if phone.foreground_component() != [MGAME, GAME_ACTIVITY]:
+        return game60_panel(phone, vision, trace)
     phone.tap(center(button))
     image, _, _ = wait_for_page(phone, vision, listing, timeout=8)
     trace.record("game60_return")
