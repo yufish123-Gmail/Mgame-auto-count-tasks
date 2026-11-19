@@ -1,6 +1,7 @@
 param(
     [switch]$Execute,
     [switch]$ReturnMgame,
+    [switch]$OpenGameCenter,
     [string]$Image,
     [string]$Serial,
     [ValidateSet('all', 'page', 'goods', 'promo', 'games', 'browse10', 'play20', 'listen30', 'watch60', 'timed')][string]$Task = 'all',
@@ -28,6 +29,7 @@ foreach ($candidate in $candidates) {
             if ($Serial) { $arguments += @('--serial', $Serial) }
             if ($Execute) { $arguments += '--execute' }
             if ($ReturnMgame) { $arguments += '--return-mgame' }
+            if ($OpenGameCenter) { $arguments += '--open-game-center' }
             if ($Image) { $arguments += @('--image', $Image) }
             & $candidate @arguments
             exit $LASTEXITCODE

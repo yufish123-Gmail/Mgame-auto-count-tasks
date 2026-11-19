@@ -1,4 +1,4 @@
-param([Parameter(Mandatory=$true)][string]$Image, [string]$Language = 'zh-Hans-CN')
+param([Parameter(Mandatory=$true)][string]$Image, [string]$Language = 'zh-Hans-CN', [switch]$Layout)
 $ErrorActionPreference = 'Stop'
 [Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false)
 Add-Type -AssemblyName System.Runtime.WindowsRuntime
@@ -25,7 +25,21 @@ try {
         $engine = [Windows.Media.Ocr.OcrEngine]::TryCreateFromLanguage([Windows.Globalization.Language]::new($Language))
         if ($null -eq $engine) { throw "Windows OCR language $Language is unavailable" }
         $result = Wait-Result ($engine.RecognizeAsync($bitmap)) ([Windows.Media.Ocr.OcrResult])
-        $result.Text
+        if ($Layout) {
+            $lines = @($result.Lines | ForEach-Object {
+                $words = @($_.Words)
+                if ($words.Count -gt 0) {
+                    $left = ($words | ForEach-Object { $_.BoundingRect.X } | Measure-Object -Minimum).Minimum
+                    $top = ($words | ForEach-Object { $_.BoundingRect.Y } | Measure-Object -Minimum).Minimum
+                    $right = ($words | ForEach-Object { $_.BoundingRect.X + $_.BoundingRect.Width } | Measure-Object -Maximum).Maximum
+                    $bottom = ($words | ForEach-Object { $_.BoundingRect.Y + $_.BoundingRect.Height } | Measure-Object -Maximum).Maximum
+                    @{ text = $_.Text; box = @($left, $top, $right, $bottom) }
+                }
+            })
+            ConvertTo-Json -InputObject $lines -Depth 4 -Compress
+        } else {
+            $result.Text
+        }
     } finally {
         $bitmap.Dispose()
     }

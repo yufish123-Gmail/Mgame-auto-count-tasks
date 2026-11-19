@@ -86,15 +86,20 @@ class TaskRowMoved(Stop):
     pass
 
 
-def run_command(*arguments):
+class CountUnreadable(Stop):
+    pass
+
+
+def run_command(*arguments, tool="ADB"):
     try:
         result = subprocess.run(arguments, capture_output=True, timeout=12, check=False)
     except (OSError, subprocess.TimeoutExpired) as exc:
-        raise Stop(f"ADB 执行失败：{exc}") from exc
+        raise Stop(f"{tool} 执行失败：{exc}") from exc
     error = result.stderr.decode("utf-8", errors="replace").strip()
     output = result.stdout.decode("utf-8", errors="replace") if arguments[-2:] != ("screencap", "-p") else ""
-    if result.returncode or "SecurityException" in error + output or "Error:" in output:
-        raise Stop(f"ADB 执行失败：{error or output.strip() or result.returncode}")
+    adb_error = tool == "ADB" and ("SecurityException" in error + output or "Error:" in output)
+    if result.returncode or adb_error:
+        raise Stop(f"{tool} 执行失败：{error or output.strip() or result.returncode}")
     return result.stdout
 
 
@@ -171,10 +176,17 @@ class Phone:
         return image
 
     def frame(self):
-        self.require_mgame()
-        image = self.capture()
-        self.require_mgame()
-        return image
+        for attempt in range(4):
+            self.require_mgame()
+            try:
+                image = self.capture()
+            except CaptureUnavailable:
+                if attempt == 3:
+                    raise
+                time.sleep(0.4)
+                continue
+            self.require_mgame()
+            return image
 
     def tap(self, point):
         self.require_mgame()
@@ -362,12 +374,14 @@ def center(box):
     return ((box[0] + box[2]) // 2, (box[1] + box[3]) // 2)
 
 
-def read_ocr(trace, image, filename):
+def read_ocr(trace, image, filename, *, layout=False):
     path = trace.directory / filename
     save_image(path, image)
-    reader = Path(__file__).resolve().parent / "read-progress.ps1"
-    return run_command("powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass",
-                       "-File", str(reader), "-Image", str(path)).decode("utf-8", errors="replace").strip()
+    arguments = ("-Layout",) if layout else ()
+    data = run_command("powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass",
+                       "-File", str(ROOT / "read-progress.ps1"), "-Image", str(path), *arguments,
+                       tool="Windows OCR")
+    return data.decode("utf-8", errors="replace").strip()
 
 
 def read_progress(image, vision, trace, label):
@@ -544,6 +558,8 @@ def wait_for_page(phone, vision, wanted, timeout=10, trace=None, *, settling=Fal
                 state = "promo_landing"
             elif component == [MGAME, PROMO_WEBVIEW] and is_travel_promo(image, trace):
                 return image, "promo_travel", None
+            elif component == [MGAME, PROMO_WEBVIEW] and vision.match(image, "promo_lowprice", (75, 110, 360, 230), 0.90):
+                return image, "promo_lowprice", None
             elif component == [MGAME, PROMO_LIVE]:
                 return image, "promo_live", None
             elif component == [MGAME, GAME_ACTIVITY] and vision.match(
@@ -703,12 +719,12 @@ def browse_external(phone, vision, trace):
 def browse_one(phone, vision, trace, before, progress):
     label = f"-{vision.task.key}-{progress[0] + 1}"
     tap_verified(phone, vision, trace, "task", label, progress)
-    wanted = {"ad", "promo_landing"} if vision.task.key == "promo" else {"ad"}
+    wanted = {"ad", "promo_landing"}
     landing, state, _ = wait_for_page(phone, vision, wanted, timeout=18, trace=trace)
     if landing is not None:
         trace.snapshot(phone, state, image=landing)
     locked = False
-    if state in {"promo_landing", "promo_travel", "promo_live", "promo_farm", "promo_attraction", "promo_rank"}:
+    if state in {"promo_landing", "promo_travel", "promo_live", "promo_farm", "promo_attraction", "promo_rank", "promo_lowprice"}:
         browse_promo_page(phone, vision, trace, page=state)
     elif state == "promo_external":
         locked = browse_external(phone, vision, trace)
@@ -763,6 +779,7 @@ def browse_promo_page(phone, vision, trace, *, page="promo_landing"):
     activity = {
         "promo_travel": PROMO_WEBVIEW, "promo_live": PROMO_LIVE, "promo_farm": GAME_ACTIVITY,
         "promo_attraction": PROMO_ATTRACTION,
+        "promo_lowprice": PROMO_WEBVIEW,
     }.get(page)
     if page == "promo_rank":
         activity = phone.foreground_component()[1]
@@ -854,14 +871,18 @@ def finish_task(phone, vision, trace, *, allow_missing=False):
     done, total = progress
     print(f"{vision.task.name} 当前进度 {done}/{total}，剩余 {total - done} 轮。", flush=True)
     for expected in range(done + 1, total + 1):
+        last_round = expected == total
+        before_count = timed_count(frame, trace, f"{vision.task.key}-{expected}-before") if last_round else None
         for _ in range(4):
             try:
                 reward = browse_one(phone, vision, trace, frame, progress)
-            except LandingUnconfirmed as exc:
+            except (LandingUnconfirmed, ForegroundChanged, CaptureUnavailable) as exc:
                 reward = recover_ad_round(phone, vision, trace, exc)
             if reward is not None:
                 break
-            frame = find_task(phone, vision, trace)
+            frame = find_task(phone, vision, trace, allow_missing=last_round)
+            if frame is None:
+                break
             refreshed = read_progress(frame, vision, trace, f"{vision.task.key}-retry-{expected}")
             if refreshed == (expected, total):
                 progress = refreshed
@@ -874,13 +895,22 @@ def finish_task(phone, vision, trace, *, allow_missing=False):
         if reward == "progress_confirmed":
             print(f"恢复后已核对进度 {expected}/{total}。", flush=True)
             continue
-        dismissed = dismiss_reward(phone, vision, trace)
-        if reward == "reward_final" or dismissed == "reward_final":
-            if expected != total:
-                raise Stop(f"Mgame已结束本组任务，上一轮进度为 {progress[0]}/{total}。")
-            print(f"最后一轮已结算，任务达到 {total}/{total}。", flush=True)
+        if reward is not None:
+            dismissed = dismiss_reward(phone, vision, trace)
+            if reward == "reward_final" or dismissed == "reward_final":
+                if not last_round:
+                    raise Stop(f"Mgame已结束本组任务，上一轮进度为 {progress[0]}/{total}。")
+                print(f"最后一轮已结算，任务达到 {total}/{total}。", flush=True)
+                break
+            frame = find_task(phone, vision, trace, allow_missing=last_round)
+        if frame is None:
+            after = phone.frame()
+            after_count = timed_count(after, trace, f"{vision.task.key}-{expected}-after")
+            if before_count is None or after_count != before_count + vision.task.reward:
+                raise Stop("最后一轮任务移出列表，但未核对到对应的领币次数增加。")
+            trace.snapshot(phone, "final-row-removed", image=after)
+            trace.record("final_row_removed", task=vision.task.key, before=before_count, after=after_count)
             break
-        frame = find_task(phone, vision, trace)
         progress = read_progress(frame, vision, trace, f"{vision.task.key}-after-{expected}")
         if progress != (expected, total):
             raise Stop(f"预期进度 {expected}/{total}，实际 {progress[0]}/{progress[1]}。")
@@ -989,7 +1019,7 @@ def game_count(image, trace, tag):
         if match:
             return int(match[1])
         padded = cv2.copyMakeBorder(padded, 8, 8, 12, 12, cv2.BORDER_CONSTANT, value=255)
-    raise Stop("无法读取游戏任务的领币次数。")
+    raise CountUnreadable("无法读取任务列表的领币次数。")
 
 
 def timed_count(image, trace, tag):
@@ -1001,6 +1031,25 @@ def timed_count(image, trace, tag):
     if re.fullmatch(r"\d{1,4}", value):
         return int(value)
     return game_count(image, trace, tag)
+
+
+def confirm_reward_count(capture, trace, tag, before, reward, timeout):
+    expected = before + reward
+    deadline = time.monotonic() + timeout
+    attempt = 0
+    while True:
+        attempt += 1
+        image = capture()
+        try:
+            after = timed_count(image, trace, f"{tag}-{attempt}")
+        except CountUnreadable:
+            after = None
+        if after == expected:
+            return image, after
+        trace.record("reward_count_retry", check=tag, attempt=attempt, expected=expected, observed=after)
+        if time.monotonic() >= deadline:
+            raise Stop(f"未确认领奖 +{reward}，原次数 {before}，最后读数 {after if after is not None else '无法识别'}。")
+        time.sleep(0.5)
 
 
 def game60_panel(phone, vision, trace):
@@ -1226,13 +1275,10 @@ def finish_games(phone, vision, trace):
             selected = game60_title(image, row[0]).copy()
         fresh = phone.frame()
         _, _, box = same_game60(fresh, game60_rows(vision, fresh), selected, "claim")
-        before = game_count(fresh, trace, f"{index}-before")
+        before = timed_count(fresh, trace, f"game60-{index}-before")
         phone.tap(center(box))
         time.sleep(2)
-        image = phone.frame()
-        after = game_count(image, trace, f"{index}-after")
-        if after != before + 3:
-            raise Stop(f"游戏领奖次数变化异常：{before} → {after}，未确认 +3。")
+        image, after = confirm_reward_count(phone.frame, trace, f"game60-{index}-after", before, 3, timeout=8)
         trace.record("game60_confirmed", before=before, after=after)
         trace.snapshot(phone, "game-reward", image=image)
         print(f"游戏奖励已到账 +3（{before} → {after}）。", flush=True)
@@ -1240,7 +1286,8 @@ def finish_games(phone, vision, trace):
 
 
 def is_store_detail(image, trace):
-    tabs = crop(image, (24, 1354, 710, 1450))
+    # Store headers wrap differently, moving the same navigation labels vertically.
+    tabs = crop(image, (24, 1200, 710, 1500))
     gray = cv2.cvtColor(tabs, cv2.COLOR_BGR2GRAY)
     if np.mean(gray > 185) < 0.65:
         return False
@@ -1350,10 +1397,12 @@ def timed_media(phone, vision, trace, rule):
     deadline = time.monotonic() + 18
     while phone.foreground_component() not in players:
         if time.monotonic() >= deadline:
-            raise Stop("未识别计时任务的播放页面。")
+            raise LandingUnconfirmed("未识别计时任务的播放页面。")
+        if listening and close_novel_ad(phone, vision, trace):
+            continue
         time.sleep(0.5)
     if listening:
-        start_novel_audio(phone, vision)
+        start_novel_audio(phone, vision, trace)
     seconds = TIMED_SECONDS[rule] + 2
     trace.record("timed_media_started", rule=rule, seconds=seconds)
     trace.snapshot(phone, rule + "-playing")
@@ -1379,11 +1428,39 @@ def leave_drama(phone):
         phone.back()
 
 
-def start_novel_audio(phone, vision):
+def close_novel_ad(phone, vision, trace):
+    component = phone.foreground_component()
+    if component != [MGAME, MGAME + ".msv.page.activity.MSVPageActivity"]:
+        return False
+    image = phone.frame()
+    close = vision.match(image, "novel_ad_close", (956, 155, 1053, 268), 0.90)
+    banner = vision.match(image, "novel_ad_banner", (70, 160, 570, 270), 0.88)
+    if not (close and banner):
+        return False
+    if phone.foreground_component() != component:
+        return False
+    phone.tap(center(close))
+    trace.snapshot(phone, "novel-ad-close-attempt", image=image, component=component)
+    time.sleep(0.6)
+    if phone.foreground_component() == component:
+        after = phone.frame()
+        if vision.match(after, "novel_ad_banner", (70, 160, 570, 270), 0.88):
+            phone.back()
+            trace.snapshot(phone, "novel-ad-back", image=after, component=component)
+            time.sleep(0.6)
+    return True
+
+
+def start_novel_audio(phone, vision, trace):
     pause_region = (156, 1905, 243, 2027)
     audio_region = (798, 1880, 1045, 1982)
-    ui_deadline = time.monotonic() + 8
+    ui_deadline = time.monotonic() + 16
     while time.monotonic() < ui_deadline:
+        if close_novel_ad(phone, vision, trace):
+            continue
+        if phone.foreground_component() != [MGAME, TIMED_PLAYERS["listen30"][0]]:
+            time.sleep(0.5)
+            continue
         image = phone.frame()
         if vision.match(image, "listen30_popup", (133, 475, 845, 566)):
             close = vision.match(image, "listen30_popup_close", (874, 480, 942, 558))
@@ -1404,13 +1481,13 @@ def start_novel_audio(phone, vision):
                     break
         time.sleep(0.75)
     else:
-        raise Stop("未确认听书控件，无法开始播放。")
+        raise LandingUnconfirmed("未确认听书控件，无法开始播放。")
     deadline = time.monotonic() + 6
     while time.monotonic() < deadline:
         if vision.match(phone.frame(), "listen30_pause", pause_region):
             return
         time.sleep(0.5)
-    raise Stop("未确认小说开始播放。")
+    raise LandingUnconfirmed("未确认小说开始播放。")
 
 
 def leave_novel_audio(phone, vision):
@@ -1439,6 +1516,10 @@ def leave_novel_audio(phone, vision):
 
 
 def finish_browse10(phone, vision, trace, rule="browse10"):
+    if rule == "listen30":
+        ad_seen = close_novel_ad(phone, vision, trace)
+        if ad_seen and phone.foreground_component() == [MGAME, MGAME + ".msv.page.activity.MSVPageActivity"]:
+            phone.recover_mgame_main(vision, trace)
     component = phone.foreground_component() if rule in TIMED_PLAYERS else None
     if rule in TIMED_PLAYERS and component in [[MGAME, activity] for activity in TIMED_PLAYERS[rule]]:
         image = timed_media(phone, vision, trace, rule)
@@ -1487,20 +1568,14 @@ def finish_browse10(phone, vision, trace, rule="browse10"):
             continue
         except LandingUnconfirmed as exc:
             launch_failures += 1
-            if rule != "browse10" or launch_failures >= 3:
+            if rule not in {"browse10", "listen30"} or launch_failures >= 3:
                 raise
             recover_ad_round(phone, vision, trace, exc)
             image = game60_panel(phone, vision, trace)
             continue
-        deadline = time.monotonic() + 10
-        while True:
-            image = game60_panel(phone, vision, trace)
-            after = timed_count(image, trace, f"{rule}-{index}-after")
-            if after == before + reward or time.monotonic() >= deadline:
-                break
-            time.sleep(0.6)
-        if after != before + reward:
-            raise Stop(f"浏览任务领币次数变化异常：{before} → {after}，预期 +{reward}。")
+        image, after = confirm_reward_count(
+            lambda: game60_panel(phone, vision, trace), trace, f"{rule}-{index}-after", before, reward, timeout=10,
+        )
         completed.append(icon)
         launch_failures = 0
         moved_attempts = 0
@@ -1589,12 +1664,55 @@ def resume_browsing(phone, trace):
     return image
 
 
+def open_game_center(phone, trace):
+    link_tapped = False
+    prompt_tapped = False
+    for step in range(8):
+        image = phone.frame()
+        trace.snapshot(phone, "game-center-navigation", image=image)
+        result = read_ocr(trace, image, f"navigation-ocr-{step + 1}.png", layout=True)
+        lines = [(re.sub(r"\s+", "", line["text"]), line["box"]) for line in json.loads(result)]
+        text = "".join(label for label, _ in lines)
+        if re.search(r"桌面入[口囗]提示", text):
+            if prompt_tapped:
+                time.sleep(0.8)
+                continue
+            dismiss = [box for label, box in lines if label == "不需要"]
+            if len(dismiss) != 1:
+                raise Stop("未确认桌面入口提示的关闭按钮。")
+            point = center(tuple(round(value) for value in dismiss[0]))
+            phone.tap(point)
+            trace.record("game_center_desktop_prompt_tapped", point=point)
+            prompt_tapped = True
+            time.sleep(0.8)
+            continue
+        if "玩游戏" in text and "好游推荐" in text and "最近在玩" in text:
+            trace.record("game_center_ready")
+            print("已确认打开游戏中心「玩游戏」首页。", flush=True)
+            return
+        if not text or link_tapped or prompt_tapped:
+            time.sleep(1)
+            continue
+        links = [box for label, box in lines if label == "游戏中心"]
+        if len(links) == 1:
+            point = center(tuple(round(value) for value in links[0]))
+            phone.tap(point)
+            trace.record("game_center_link_tapped", point=point)
+            link_tapped = True
+        else:
+            phone.back()
+            trace.record("game_center_navigation_back", step=step)
+        time.sleep(0.8)
+    raise Stop("未确认游戏中心首页，请查看程序导航截图。")
+
+
 def main():
     parser = argparse.ArgumentParser(description="自动加次数任务 · Mgame 本地助手")
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument("--execute", action="store_true", help="按页面进度完成剩余轮次")
     mode.add_argument("--image", type=Path, help="离线识别指定截图，不连接手机")
     mode.add_argument("--return-mgame", action="store_true", help="从手机桌面和最近任务返回Mgame主界面")
+    mode.add_argument("--open-game-center", action="store_true", help="返回并通过游戏中心链接进入首页")
     parser.add_argument("--serial", help="ADB USB 真机序列号，省略时选择唯一已授权的真机")
     parser.add_argument("--task", choices=("all", *(task.key for task in TASKS), "games", *TIMED_SECONDS, "timed"), default="all")
     args = parser.parse_args()
@@ -1613,6 +1731,11 @@ def main():
                 trace = Trace("return_mgame")
                 Phone(args.serial).recover_mgame_main(Vision(), trace)
                 print("已确认返回Mgame主界面。", flush=True)
+                return 0
+            if args.open_game_center:
+                trace = Trace("open_game_center")
+                phone = Phone(args.serial)
+                open_game_center(phone, trace)
                 return 0
             trace = Trace("execute" if args.execute else "offline" if args.image else "preview")
             visions = [Vision(task) for task in TASKS if args.task in {"all", task.key}]
@@ -1672,7 +1795,7 @@ def main():
     except (Stop, OSError, ValueError, KeyError, cv2.error) as exc:
         if trace:
             trace.record("stopped", reason=str(exc))
-            if phone is not None and args.execute:
+            if phone is not None and (args.execute or args.open_game_center):
                 trace.snapshot(phone, "stopped")
         print(f"已停止：{exc}", file=sys.stderr)
         return 2

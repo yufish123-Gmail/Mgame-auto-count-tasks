@@ -2,11 +2,13 @@
 
 维护 Windows 上的手机辅助程序。程序通过 ADB 读取已授权安卓真机的界面，根据任务进度完成浏览、游玩、听书和短剧任务，并核对领币次数。面向使用者的步骤见 [使用手册](README.md)，阶段规则和实测记录见 [交接说明](交接说明.md)。
 
+开始工作时先读 [项目状态](项目状态.md)，核对最近回测、证据路径和待验证项。
+
 ## 接手后先做什么
 
 1. 在仓库根目录检查 `git status --short --branch`，查看用户是否已有未提交修改。用 `adb devices -l` 确认手机在线，核对已解锁、1080×2400 竖屏和应用当前画面。只有一台已授权真机时程序会自行选择，多台时用 `-Serial` 指定。
 2. 有历史截图时先用 `-Image <截图路径>` 离线检查。手机停在「我的」「领币页」或「加次数」时，可先运行下方的只读命令。只读模式只识别当前画面，屏幕之外的任务不在预览结果里。
-3. 用户要求真机回测时，按当前任务状态续跑。下次重置后的首轮回测应从「我的」进入列表并执行完整流程，重点验证听小说能否自动关闭签到浮层、确认播放、等待 32 秒、退出并领奖。上一轮听书的播放确认和退出有人工介入。
+3. 用户要求真机回测时，按当前任务状态续跑。优先通过程序保存的截图和日志判断执行效果。当前结论以 [项目状态](项目状态.md) 中的日期和证据为准。
 
 ```powershell
 # 识别当前画面
@@ -17,6 +19,9 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\run.ps1 -Task listen30 -Ex
 
 # 依次执行全部阶段
 powershell -NoProfile -ExecutionPolicy Bypass -File .\run.ps1 -Task all -Execute
+
+# 单独导航到游戏中心
+powershell -NoProfile -ExecutionPolicy Bypass -File .\run.ps1 -OpenGameCenter
 ```
 
 ## 改哪里、怎么验证
@@ -26,3 +31,13 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\run.ps1 -Task all -Execute
 - 遇到陌生页面时，用当前截图和前台活动确认页面类型与退出控件。若卡在广告或其他应用，先等当前运行停止，再用 `-ReturnMgame` 返回 Mgame 主界面。重新进入「加次数」后按实际进度续跑。
 - 每次运行查看 `runs/<运行编号>/events.jsonl`。用 `stage_started` 找到出错阶段，用 `stopped` 或 `ad_recovery` 看原因。日志里的 `screenshot` 事件指向程序保存的截图，`screenshot_unavailable` 表示该画面未能保存。以 `task_complete`、`game60_confirmed` 或 `timed_confirmed` 结合截图核对结算。`stage_finished` 的 `elapsed_seconds` 可用于比较同阶段耗时，该事件也可能表示扫描后跳过。
 - 提交前检查 `git diff --check`。代码有变化时先跑 Python 语法检查，再验证改动涉及的阶段。回测报告写明完成进度、实际到账次数、人工介入和日志路径。保留提交所需的局部模板，运行日志、完整截图和本机环境由 `.gitignore` 排除。
+
+## 优化日志
+
+### 2026-11-20
+
+- `finish_task` 在每轮按进度确认，末轮才额外读取次数。若末轮恢复后已找不到任务行，先确认完整扫描过列表，再核对次数增量，用 `final_row_removed` 记录证据。普通轮次可用 `progress` 和 `task_complete` 核对。
+- `Phone.frame` 对短暂无图做有限重试。应用锁导致的前台切换交给已有广告恢复流程，先用 `ad_recovery` 截图判断落地页，再核对实际进度。
+- `confirm_reward_count` 统一 60 秒游戏和其他计时奖励的到账判断。用 `reward_count_retry` 中的 `expected`、`observed` 和 `attempt` 对照独立编号的 OCR 图片。末轮浏览的行消失校验仍按该阶段自己的奖励核对。
+- `open_game_center` 复用 Windows OCR 的坐标输出。用 `navigation-ocr-*.png` 对照 `game_center_link_tapped`、`game_center_desktop_prompt_tapped`、`game_center_ready`。只有首页标题和栏目均识别到，且桌面入口提示已消失，才记录就绪。两条手机流程按顺序接力。
+- 11 月 20 日真机分段跑完 8 个阶段，最终次数 261。听书直接结算 +2，仍需验证插屏恢复后完整播放。后续整理以历史截图和模拟流程验证，下一次真机重置时重点核对单次全流程、末轮恢复和听书计时。
