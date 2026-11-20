@@ -283,9 +283,13 @@ class Vision:
         self.task = task
         self.templates = load_templates()
 
-    def match(self, image, name, region, minimum=0.90, competing=None):
+    def match(self, image, name, region, minimum=0.90, competing=None, *, white_mask=False):
         template = self.templates[name]
         view = cv2.cvtColor(crop(image, region), cv2.COLOR_BGR2GRAY)
+        if white_mask:
+            # Isolate white controls from a changing video background.
+            _, view = cv2.threshold(view, 220, 255, cv2.THRESH_BINARY)
+            _, template = cv2.threshold(template, 220, 255, cv2.THRESH_BINARY)
         height, width = template.shape
         if height > view.shape[0] or width > view.shape[1]:
             return None
@@ -295,6 +299,8 @@ class Vision:
             return None
         if competing:
             other = self.templates[competing]
+            if white_mask:
+                _, other = cv2.threshold(other, 220, 255, cv2.THRESH_BINARY)
             other_score = cv2.minMaxLoc(cv2.matchTemplate(view, other, cv2.TM_CCOEFF_NORMED))[1]
             if score < other_score + 0.015:
                 return None
@@ -764,14 +770,18 @@ def close_promo_live(phone, vision, trace):
             close = vision.match(image, "live_follow_close", (970, 1750, 1044, 1840))
         else:
             close = vision.match(image, "live_exit", (962, 144, 1046, 219), 0.78)
+            if close is None:
+                close = vision.match(image, "live_exit", (962, 144, 1046, 219), 0.94, white_mask=True)
         if close is None:
             break
+        if phone.foreground_component() != [MGAME, PROMO_LIVE]:
+            return
         phone.tap(center(close))
-        trace.record("live_closed", target="follow_popup" if follow else "room", point=center(close))
+        trace.record("live_close_tapped", target="follow_popup" if follow else "room", point=center(close))
         time.sleep(0.75)
     if phone.foreground_component() != [MGAME, PROMO_LIVE]:
         return
-    raise Stop("无法确认直播页关闭按钮。")
+    raise LandingUnconfirmed("无法确认直播页关闭按钮。")
 
 
 def browse_promo_page(phone, vision, trace, *, page="promo_landing"):
@@ -1412,6 +1422,7 @@ def timed_media(phone, vision, trace, rule):
         if phone.foreground_component() not in players:
             raise Stop("计时期间播放页离开前台。")
         time.sleep(0.5)
+    trace.record("timed_media_completed", rule=rule, seconds=seconds)
     phone.back()
     if listening:
         leave_novel_audio(phone, vision)
@@ -1462,11 +1473,18 @@ def start_novel_audio(phone, vision, trace):
             time.sleep(0.5)
             continue
         image = phone.frame()
-        if vision.match(image, "listen30_popup", (133, 475, 845, 566)):
-            close = vision.match(image, "listen30_popup_close", (874, 480, 942, 558))
-            if close:
-                phone.tap(center(close))
+        popup = vision.match(image, "listen30_popup", (133, 475, 845, 700))
+        if popup:
+            close = vision.match(image, "listen30_popup_close", (874, popup[1], 942, popup[3] + 20))
+            if close is None:
+                raise LandingUnconfirmed("已识别听书签到浮层，未确认关闭按钮。")
+            if phone.foreground_component() != [MGAME, TIMED_PLAYERS["listen30"][0]]:
+                raise LandingUnconfirmed("关闭听书签到浮层前页面已切换。")
+            trace.snapshot(phone, "novel-popup-close-attempt", image=image)
+            phone.tap(center(close))
+            trace.record("novel_popup_close_tapped", point=center(close))
         elif vision.match(image, "listen30_pause", pause_region):
+            trace.record("novel_playback_confirmed")
             return
         else:
             start = vision.match(image, "listen30_page_audio", audio_region)
@@ -1485,6 +1503,7 @@ def start_novel_audio(phone, vision, trace):
     deadline = time.monotonic() + 6
     while time.monotonic() < deadline:
         if vision.match(phone.frame(), "listen30_pause", pause_region):
+            trace.record("novel_playback_confirmed")
             return
         time.sleep(0.5)
     raise LandingUnconfirmed("未确认小说开始播放。")

@@ -6,7 +6,7 @@
 
 ## 接手后先做什么
 
-1. 在仓库根目录检查 `git status --short --branch`，查看用户是否已有未提交修改。用 `adb devices -l` 确认手机在线，核对已解锁、1080×2400 竖屏和应用当前画面。只有一台已授权真机时程序会自行选择，多台时用 `-Serial` 指定。
+1. 在仓库根目录检查 `git status --short --branch` 和 `git log -1`，查看用户是否已有未提交修改。11 月 21 日回测以 `e1215b230dfcd37febbee8ff14aa2a3c00f6257d` 为基线，现场修复及后续整理已纳入 Git 跟踪。再次同步前，应核对并保留本地修改。用 `adb devices -l` 确认手机在线，核对已解锁、1080×2400 竖屏和应用当前画面。只有一台已授权真机时程序会自行选择，多台时用 `-Serial` 指定。
 2. 有历史截图时先用 `-Image <截图路径>` 离线检查。手机停在「我的」「领币页」或「加次数」时，可先运行下方的只读命令。只读模式只识别当前画面，屏幕之外的任务不在预览结果里。
 3. 用户要求真机回测时，按当前任务状态续跑。优先通过程序保存的截图和日志判断执行效果。当前结论以 [项目状态](项目状态.md) 中的日期和证据为准。
 
@@ -33,6 +33,31 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\run.ps1 -OpenGameCenter
 - 提交前检查 `git diff --check`。代码有变化时先跑 Python 语法检查，再验证改动涉及的阶段。回测报告写明完成进度、实际到账次数、人工介入和日志路径。保留提交所需的局部模板，运行日志、完整截图和本机环境由 `.gitignore` 排除。
 
 ## 优化日志
+
+### 2026-11-21
+
+本次真机回测从同步的 `e1215b2` 开始，首段与续跑合计约 43 分钟。浏览页面 5/5、好物 10/10、优惠活动 15/15；60 秒游戏 7 项，各 +3；浏览 10 秒 5 项，各 +2；20 秒游戏 4 项，依次 +1、+2、+2、+1；听书和短剧各 +2。最终截图为 229 次。首次运行在直播退出时中断，Agent 修改程序后重启一次全流程，随后按实际进度跳过已完成阶段，正常退出。
+
+- 首段日志为 `runs/20261121-002049-919055/events.jsonl`，包含前三项浏览的进度和直播停止原因。完整现场图 `live-exit-diagnostic.png` 可用于退出键回归。
+- 直播单独恢复记录为 `runs/20261121-003144-068178`。续跑日志为 `runs/20261121-003152-345517/events.jsonl`，以 `all_stages_finished` 和退出码 0 结束。最终次数截图为 `screen-097-stage-end.jpg`。
+- 听书现场 `screen-090-ad-recovery.jpg` 显示签到浮层下移。该轮未确认播放，自动恢复后平台显示可领奖，已核对 225 → 227。短剧有 `timed_media_started` 的连续 62 秒计时，到账 227 → 229。
+
+本次启动通过 `-Python` 指定相邻项目的环境。本地可复用以下命令，先运行预览，再按用户授权执行任务。
+
+```powershell
+$python = (Resolve-Path '..\Mgame-FCash-auto-tasks\.venv\Scripts\python.exe').Path
+powershell -NoProfile -ExecutionPolicy Bypass -File .\run.ps1 -Python $python
+powershell -NoProfile -ExecutionPolicy Bypass -File .\run.ps1 -Python $python -Task all -Execute
+```
+
+后续优化在真机任务已完成后做离线回归。
+
+- `Vision.match(..., white_mask=True)` 复用模板匹配和候选唯一性检查，以 220 的阈值提取白色控件。直播仍先使用原灰度模板，失败后在固定右上角区域以 0.94 匹配白色 X。点击前复核直播组件，识别失败抛 `LandingUnconfirmed`，由 `finish_task` 已有的最多四次尝试恢复和核对进度。
+- 直播点击记为 `live_close_tapped`。该事件只证明已发送点击，退出结果结合后续前台组件和结算确认。
+- 听书签到标题搜索范围扩展至 y=475～700，关闭键纵向区域由匹配到的标题决定。已识别浮层但找不到关闭键时，明确记录失败并转入有限恢复流程。点击前检查阅读器组件，`novel-popup-close-attempt` 保存现场，`novel_popup_close_tapped` 记录点击。
+- `novel_playback_confirmed` 表示看到了暂停控件，`timed_media_started` 表示开始等待，新增 `timed_media_completed` 表示前台计时循环完整结束。`timed_confirmed` 继续只记录到账。旧日志可能没有新事件，回看历史时按当时版本解释。
+
+下次任务重置后优先跑 `-Task listen30 -Execute`，核对关闭签到浮层、播放确认、连续 32 秒、退出及 +2 到账。直播恢复调整和听书浮层调整均需补下一轮真机覆盖。手机操作沿用程序执行，Agent 根据保存截图修改后续跑。
 
 ### 2026-11-20
 
