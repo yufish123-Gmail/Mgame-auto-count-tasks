@@ -528,7 +528,7 @@ def wait_for_page(phone, vision, wanted, timeout=10, trace=None, *, settling=Fal
     deadline = time.monotonic() + timeout
     state = "unknown"
     entry_failed = False
-    closed_webview = False
+    closed_webviews = 0
     returned_from_lock = False
     while time.monotonic() < deadline:
         try:
@@ -580,9 +580,9 @@ def wait_for_page(phone, vision, wanted, timeout=10, trace=None, *, settling=Fal
                 return image, "promo_rank", None
         if state in wanted:
             return image, state, box
-        if state == "unknown" and settling and not closed_webview:
-            closed_webview = close_ad_webview(phone, vision, image, trace)
-            if closed_webview:
+        if state == "unknown" and settling and closed_webviews < 3:
+            if close_ad_webview(phone, vision, image, trace):
+                closed_webviews += 1
                 deadline = time.monotonic() + timeout
         time.sleep(0.45)
     if entry_failed:
@@ -676,10 +676,11 @@ def browse_external(phone, vision, trace):
         time.sleep(0.4)
     else:
         raise LandingUnconfirmed("未确认落地应用，无法开始计时。")
+    started = time.monotonic()
     trace.record("landing", package=package)
     trace.snapshot(phone, "app-lock" if package == APP_LOCK else "external-landing")
     if package != APP_LOCK:
-        until = time.monotonic() + vision.task.seconds + 2
+        until = started + vision.task.seconds + 2
         last_allowed = time.monotonic()
         while time.monotonic() < until:
             foreground = phone.foreground()
@@ -1172,9 +1173,10 @@ def play_game60(phone, vision, trace, seconds=GAME_WAIT_SECONDS):
             raise Stop("按 Home 后未确认回到手机桌面。")
         time.sleep(0.4)
     trace.record("game60_background_started", seconds=seconds)
+    deadline = time.monotonic() + seconds
     trace.snapshot(phone, "game-desktop")
     print(f"已回到手机桌面，等待 {seconds} 秒后切回Mgame。", flush=True)
-    time.sleep(seconds)
+    time.sleep(max(0, deadline - time.monotonic()))
     trace.record("game60_timer_elapsed", seconds=seconds, mode="background")
     phone.return_to_mgame()
     try:
@@ -1344,8 +1346,9 @@ def browse10_landing(phone, vision, trace):
                     and vision.match(image, "browse10_wallet", (79, 120, 416, 212)))
                 or vision.match(image, "browse10_group", (80, 103, 287, 195))):
                 trace.record("browse10_landing", activity=component[1], seconds=12)
+                deadline = time.monotonic() + 12
                 trace.snapshot(phone, "browse-landing", image=image, component=component)
-                time.sleep(12)
+                time.sleep(max(0, deadline - time.monotonic()))
                 if phone.foreground_component() != component:
                     raise Stop("浏览过程中页面已切换，未确认本轮。")
                 if monthly:
@@ -1415,13 +1418,15 @@ def timed_media(phone, vision, trace, rule):
         start_novel_audio(phone, vision, trace)
     seconds = TIMED_SECONDS[rule] + 2
     trace.record("timed_media_started", rule=rule, seconds=seconds)
+    deadline = time.monotonic() + seconds
     trace.snapshot(phone, rule + "-playing")
     print(f"已打开播放页，前台停留 {seconds} 秒。", flush=True)
-    deadline = time.monotonic() + seconds
     while time.monotonic() < deadline:
         if phone.foreground_component() not in players:
             raise Stop("计时期间播放页离开前台。")
         time.sleep(0.5)
+    if phone.foreground_component() not in players:
+        raise Stop("计时结束时播放页已离开前台。")
     trace.record("timed_media_completed", rule=rule, seconds=seconds)
     phone.back()
     if listening:
@@ -1639,15 +1644,27 @@ def run_stages(phone, trace, task_key, visions, settled):
         print(f"[{number}/{len(stages)}] {label}", flush=True)
         trace.record("stage_started", stage=key, number=number, total=len(stages))
         trace.snapshot(phone, "stage-start")
+        recoveries = 0
         if key not in settled:
-            if key == "games":
-                finish_games(phone, vision, trace)
-            elif key in TIMED_SECONDS:
-                finish_browse10(phone, vision, trace, key)
-            else:
-                finish_task(phone, vision, trace, allow_missing=True)
+            for attempt in range(3):
+                try:
+                    if key == "games":
+                        finish_games(phone, vision, trace)
+                    elif key in TIMED_SECONDS:
+                        finish_browse10(phone, vision, trace, key)
+                    else:
+                        finish_task(phone, vision, trace, allow_missing=True)
+                    break
+                except (ForegroundChanged, CaptureUnavailable, LandingUnconfirmed, CountUnreadable) as exc:
+                    if attempt == 2:
+                        raise
+                    recoveries += 1
+                    trace.record("stage_recovery", attempt=attempt + 1, reason=str(exc))
+                    trace.snapshot(phone, "stage-recovery")
+                    phone.recover_mgame_main(vision, trace)
         trace.snapshot(phone, "stage-end")
-        trace.record("stage_finished", stage=key, elapsed_seconds=round(time.monotonic() - started, 1))
+        trace.record("stage_finished", stage=key, recoveries=recoveries,
+                     elapsed_seconds=round(time.monotonic() - started, 1))
     trace.stage = None
     if task_key == "all":
         trace.record("all_stages_finished")
@@ -1782,6 +1799,7 @@ def main():
                 run_stages(phone, trace, args.task, visions, settled)
             else:
                 image = load_image(args.image) if args.image else phone.frame()
+                check_size(image)
                 if args.task in {"games", *TIMED_SECONDS, "timed"}:
                     vision = Vision()
                     rules = ("play20", "listen30", "watch60") if args.task == "timed" else (args.task,)

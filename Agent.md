@@ -34,6 +34,18 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\run.ps1 -OpenGameCenter
 
 ## 优化日志
 
+### 2026-11-22
+
+优化以 Python 程序自主执行和恢复为主。直接入口为 `python coin_helper.py --execute --task all`，也兼容既有 `run.ps1` 和 CMD 入口。解释器需安装 requirements.txt 中的依赖。本机已创建项目 `.venv` 并安装依赖，可用 `.\.venv\Scripts\python.exe` 直接执行或由启动器自动选取。11 月 21 日使用的相邻环境路径保留作历史记录。
+
+- `run_stages` 对 `ForegroundChanged`、`CaptureUnavailable`、`LandingUnconfirmed`、`CountUnreadable` 增加阶段级恢复。每阶段最多执行 3 次，恢复时记录 `stage_recovery` 的 `attempt` 和 `reason`，保存截图后调用 `recover_mgame_main`，重新执行当前阶段并读取实际进度。此前阶段不会重新运行。内部原有按轮、按任务重试仍存在，各自遵守现有上限。
+- `stage_finished.recoveries` 是阶段级恢复次数，结合 `elapsed_seconds` 对比效率。达到第三次失败、恢复主界面失败或其他停止条件时，会沿正常入口记录 `stopped` 并以退出码 2 退出。到账不符的普通 `Stop` 不会由阶段恢复自动重试。
+- `wait_for_page` 的结算等待最多关闭 3 层已识别 WebView，每次成功匹配关闭后刷新等待截止时间。即使关闭无效，次数也有上限。
+- 外部浏览、10 秒浏览、游戏桌面计时和媒体播放在确认目标后设定单调时钟截止时间，将取证截图耗时纳入等待。游戏只等待剩余时长。媒体结束前再次核对前台组件。后续比较耗时时应同时核对真实等待区间与奖励证据。
+- 离线 `--image` 模式对所有任务统一调用 `check_size`，尺寸不符会返回错误，避免计时任务预览误报 0 项。
+
+发布前执行 `python -m unittest discover -s tests -v`，以及 `git diff --check` 和 Python 编译。测试模拟阶段恢复、错误类型、已处理阶段跳过、广告页关闭上限、截图耗时与计时中断，不连接手机。用现场截图补查直播退出和听书签到浮层定位。此次优化尚未完整真机回测，下一轮继续验证听书完整播放和无需重启的整条流程，并对比约 43 分钟的历史整轮用时。
+
 ### 2026-11-21
 
 本次真机回测从同步的 `e1215b2` 开始，首段与续跑合计约 43 分钟。浏览页面 5/5、好物 10/10、优惠活动 15/15；60 秒游戏 7 项，各 +3；浏览 10 秒 5 项，各 +2；20 秒游戏 4 项，依次 +1、+2、+2、+1；听书和短剧各 +2。最终截图为 229 次。首次运行在直播退出时中断，Agent 修改程序后重启一次全流程，随后按实际进度跳过已完成阶段，正常退出。
