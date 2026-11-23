@@ -4,6 +4,8 @@
 
 开始工作时先读 [项目状态](项目状态.md)，核对最近回测、证据路径和待验证项。
 
+本项目生成的计划、日志、截图及其他临时文件均保存在仓库目录内。计划用 `.planning/`，运行证据用 `runs/`。
+
 ## 接手后先做什么
 
 1. 在仓库根目录检查 `git status --short --branch` 和 `git log -1`，查看用户是否已有未提交修改。11 月 21 日回测以 `e1215b230dfcd37febbee8ff14aa2a3c00f6257d` 为基线，现场修复及后续整理已纳入 Git 跟踪。再次同步前，应核对并保留本地修改。用 `adb devices -l` 确认手机在线，核对已解锁、1080×2400 竖屏和应用当前画面。只有一台已授权真机时程序会自行选择，多台时用 `-Serial` 指定。
@@ -17,7 +19,10 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\run.ps1
 # 单独回测听书
 powershell -NoProfile -ExecutionPolicy Bypass -File .\run.ps1 -Task listen30 -Execute
 
-# 依次执行全部阶段
+# 单独回测跳转登录 APP 领奖励，也可双击跳转登录APP领奖励.cmd
+powershell -NoProfile -ExecutionPolicy Bypass -File .\run.ps1 -Task appjump -Execute
+
+# 依次执行八个日常阶段
 powershell -NoProfile -ExecutionPolicy Bypass -File .\run.ps1 -Task all -Execute
 
 # 单独导航到游戏中心
@@ -27,6 +32,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\run.ps1 -OpenGameCenter
 ## 改哪里、怎么验证
 
 - [coin_helper.py](coin_helper.py) 中的 `run_stages` 固定顺序。三个重复浏览任务在 `finish_task`，60 秒游戏在 `finish_games`，其余计时任务在 `finish_browse10` 和 `timed_media`。启动参数由 [run.ps1](run.ps1) 转发，界面模板在 `templates/`，Windows OCR 在 `read-progress.ps1`。
+- 独立的 `appjump` 由 `-Task appjump` 显式启动。`visit_app_jump` 确认目标包名进入前台后连续计时 10 秒，中断则重新计时。返回美团后，`finish_app_jump` 核对「可领取」和 `x/8`，暂无可用入口时最多等待并刷新两次，记录 `app_jump_settlement_wait`。当本轮已确认有效停留且刷新后仍无可用入口时，阶段最多重开美团一次，保留本轮已尝试的入口并记录 `app_jump_restart_mgame`。`app_jump_visit_elapsed` 只表示计时到达，结算结果以 `app_jump_result` 和 `app_jump_progress` 为准。真机回测和 8/8 证据见 [项目状态](项目状态.md)。
 - 保留原任务的识别依据。浏览奖励按小字匹配。同一行出现下单奖励时，只处理浏览部分。短剧和听书在播放页计时。领奖前核对同一行的「可领奖」，领奖后核对实际次数增加。
 - 遇到陌生页面时，用当前截图和前台活动确认页面类型与退出控件。若卡在广告或其他应用，先等当前运行停止，再用 `-ReturnMgame` 返回 Mgame 主界面。重新进入「加次数」后按实际进度续跑。
 - 每次运行查看 `runs/<运行编号>/events.jsonl`。用 `stage_started` 找到出错阶段，用 `stopped` 或 `ad_recovery` 看原因。日志里的 `screenshot` 事件指向程序保存的截图，`screenshot_unavailable` 表示该画面未能保存。以 `task_complete`、`game60_confirmed` 或 `timed_confirmed` 结合截图核对结算。`stage_finished` 的 `elapsed_seconds` 可用于比较同阶段耗时，该事件也可能表示扫描后跳过。

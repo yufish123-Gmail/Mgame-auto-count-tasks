@@ -1,4 +1,5 @@
 /.venv/
+/.planning/
 __pycache__/
 *.py[cod]
 /runs/

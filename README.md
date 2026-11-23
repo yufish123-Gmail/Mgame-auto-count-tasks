@@ -28,7 +28,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\run.ps1 -Python $python -T
 
 游戏计时中会暂时回到手机桌面，等程序自己切回Mgame。运行时不要手动操作手机。结束后到「领币页 → 加次数」核对进度和领币次数。
 
-## 执行顺序
+## 日常任务顺序
 
 1. 浏览页面领奖励（3 秒）
 2. 浏览好物（5 秒）
@@ -55,6 +55,16 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\run.ps1 -Python $python -T
 
 游戏等待 62/22 秒、听书 32 秒、短剧 62 秒沿用当前规则。截图和日志写入耗时计入对应的浏览、游戏和媒体等待区间，减少计时之外的重复等待。播放计时结束时会再次确认前台页面。
 
+## 独立任务 · 跳转登录 APP 领奖励
+
+需要时双击 [跳转登录APP领奖励.cmd](跳转登录APP领奖励.cmd)。日常启动器和 `--task all` 只执行上面的八个日常阶段。也可在本目录运行以下命令来单独执行。
+
+```powershell
+.\.venv\Scripts\python.exe .\coin_helper.py --execute --task appjump
+```
+
+程序优先领取已显示「可领取」的奖励。其他入口跳转到已安装的对应 APP，在确认前台后连续停留 10 秒，再返回美团核对 `x/8`。如果已有 APP 完成停留，等待并刷新后仍无可继续的入口，独立流程会重开一次美团再核对。
+
 ## 中途停住
 
 先记下窗口里的阶段、停止原因和运行记录路径。把手机恢复到Mgame「我的」或「加次数」，再双击运行。若卡在其他应用或插屏，等上一次运行停止后，在电脑 PowerShell 运行以下命令返回Mgame：
@@ -70,6 +80,10 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\run.ps1 -OpenGameCenter
 ```
 
 ## 优化日志
+
+### 2026-11-23
+
+- 新增独立项目「跳转登录 APP 领奖励」。真机核对到 8/8，领币次数从 296 增至 315。关闭三个目标 APP 的后台进程后，进度仍为 5/8。重开美团并续跑后领完剩余三项。各 APP 的结果和日志路径见 [项目状态](项目状态.md)。
 
 ### 2026-11-22
 

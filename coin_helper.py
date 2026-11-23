@@ -30,14 +30,31 @@ PROMO_LIVE = "com.dianping.live.live.mrn.MLiveMRNActivity"
 PROMO_GROUP = "com.meituan.android.mtgb.business.main.MTGMainActivity"
 PROMO_ATTRACTION = "com.meituan.traveltools.mrncontainer.HTMRNBaseActivity"
 AD_WEBVIEW = "com.ubix.ssp.open.comm.UBiXWebViewActivity"
+PROMO_PORTRAIT_AD = "com.qq.e.ads.PortraitADActivity"
+PROMO_VIDEO_AD = MGAME + ".msv.page.activity.MSVPageActivity"
+PROMO_SIGMOB_AD = "com.sigmob.sdk.base.common.PortraitAdActivity"
+DOUYIN_PACKAGE = "com.ss.android.ugc.aweme"
+DOUYIN_OPEN_BUTTON = (215, 2120, 870, 2230)
+PROMO_VIDEO_END_BUTTON = (433, 1325, 647, 1434)
 PROMO_EXTERNAL_APPS = {"com.dianping.v1"}
-GOODS_EXTERNAL_APPS = {"com.qiyi.video", "com.UCMobile", "com.tencent.qqlive", "com.ss.android.ugc.aweme"}
+GOODS_EXTERNAL_APPS = {"com.qiyi.video", "com.UCMobile", "com.tencent.qqlive", DOUYIN_PACKAGE, "com.ss.android.article.lite"}
 GAME_ACTIVITY = "com.meituan.android.mgc.container.MGCGameActivity"
 GAME_AD = "com.windmill.sdk.widget.InterstitialView_4012001"
 GAME_AD_COMPACT = "com.windmill.sdk.widget.InterstitialView_4012003"
 GAME60_AD_COMPONENTS = ([MGAME, GAME_AD], [MGAME, GAME_AD_COMPACT])
 GAME_COMPONENTS = ([MGAME, GAME_ACTIVITY], *GAME60_AD_COMPONENTS)
 GAME_WAIT_SECONDS = 62
+APP_JUMP_WAIT_SECONDS = 10
+APP_JUMP_TARGETS = {
+    "百度极速版": "com.baidu.searchbox.lite",
+    "QQ音乐": "com.tencent.qqmusic",
+    "UC浏览器": "com.UCMobile",
+    "芒果TV": "com.hunantv.imgo.activity",
+    "猫耳FM": "cn.missevan",
+    "书旗小说": "com.shuqi.controller",
+    "头条极速": "com.ss.android.article.lite",
+    "百度地图": "com.baidu.BaiduMap",
+}
 LANDING_APPS = {
     "com.android.browser", "com.alibaba.wireless", "com.kuaishou.nebula",
     "com.tmall.wireless", "com.taobao.taobao", "com.baidu.netdisk",
@@ -70,6 +87,10 @@ class Stop(RuntimeError):
     pass
 
 
+class RoundUnsettled(Stop):
+    pass
+
+
 class ForegroundChanged(Stop):
     pass
 
@@ -90,6 +111,10 @@ class CountUnreadable(Stop):
     pass
 
 
+class DeviceDisconnected(Stop):
+    pass
+
+
 def run_command(*arguments, tool="ADB"):
     try:
         result = subprocess.run(arguments, capture_output=True, timeout=12, check=False)
@@ -99,7 +124,11 @@ def run_command(*arguments, tool="ADB"):
     output = result.stdout.decode("utf-8", errors="replace") if arguments[-2:] != ("screencap", "-p") else ""
     adb_error = tool == "ADB" and ("SecurityException" in error + output or "Error:" in output)
     if result.returncode or adb_error:
-        raise Stop(f"{tool} 执行失败：{error or output.strip() or result.returncode}")
+        message = f"{tool} 执行失败：{error or output.strip() or result.returncode}"
+        disconnected = r"device(?: '[^']+')? (?:not found|offline|unauthorized)|no devices/emulators found"
+        if tool == "ADB" and re.search(disconnected, error, re.I):
+            raise DeviceDisconnected(message)
+        raise Stop(message)
     return result.stdout
 
 
@@ -117,7 +146,7 @@ def decode(data):
         raise CaptureUnavailable("截图暂不可用，手机可能正在切换页面。")
     image = cv2.imdecode(np.frombuffer(data, np.uint8), cv2.IMREAD_COLOR)
     if image is None:
-        raise Stop("无法读取截图。")
+        raise CaptureUnavailable("截图不完整或无法解码。")
     return image
 
 
@@ -155,6 +184,18 @@ class Phone:
     def adb_call(self, *arguments):
         return run_command(self.adb, "-s", self.serial, *arguments)
 
+    def wait_for_usb(self, timeout=45):
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            try:
+                if self.adb_call("get-state").strip() == b"device":
+                    self.foreground_component()
+                    return
+            except DeviceDisconnected:
+                pass
+            time.sleep(1)
+        raise DeviceDisconnected("USB 调试连接未恢复，请重新连接并授权原手机。")
+
     def foreground_component(self):
         output = self.adb_call("shell", "dumpsys", "activity", "activities").decode(errors="replace")
         match = re.search(r"(?:topResumedActivity=|mResumedActivity:).*?\s([\w.]+/[\w.$]+)", output)
@@ -170,9 +211,11 @@ class Phone:
         if self.foreground() != MGAME:
             raise ForegroundChanged("请把Mgame放在前台。")
 
-    def capture(self):
+    def capture(self, *, calibrated=True):
         image = decode(self.adb_call("exec-out", "screencap", "-p"))
-        check_size(image)
+        width, height = image.shape[1::-1]
+        if calibrated and (width, height) != SIZE:
+            raise CaptureUnavailable(f"截图暂为 {width}×{height}，等待 1080×2400 竖屏恢复。")
         return image
 
     def frame(self):
@@ -232,7 +275,10 @@ class Phone:
         time.sleep(0.8)
         deadline = time.monotonic() + 4
         while time.monotonic() < deadline and self.foreground() == launcher:
-            image = self.capture()
+            try:
+                image = self.capture()
+            except CaptureUnavailable:
+                break
             icon = vision.match(image, "mgame_recent", (20, 235, 1061, 2150), 0.94)
             if icon and self.foreground() == launcher:
                 # This launcher places the task preview immediately below its app icon.
@@ -258,6 +304,35 @@ class Phone:
                 raise Stop("切换后未确认Mgame主界面已打开。")
             time.sleep(0.4)
         trace.record("recovery_main_confirmed")
+
+    def restart_mgame(self, vision, trace):
+        self.require_mgame()
+        self.adb_call("shell", "am", "force-stop", MGAME)
+        self.return_to_mgame()
+        trace.record("recovery_cold_restart")
+        main = MGAME_MAIN.split("/", 1)
+        deadline = time.monotonic() + 15
+        while time.monotonic() < deadline:
+            if self.foreground_component() == main:
+                try:
+                    image = self.frame()
+                except (ForegroundChanged, CaptureUnavailable):
+                    continue
+                if vision.identify(image)[0] == "profile":
+                    return
+                top = 2180
+                raw = read_ocr(trace, image[top:2355], "recovery-home-tabs.png", layout=True)
+                tabs = [(re.sub(r"\s+", "", line["text"]), line["box"]) for line in json.loads(raw)]
+                profile = [box for label, box in tabs if label == "我的" and 880 < box[0] < 1030]
+                if len(profile) == 1 and any(label == "推荐" for label, _ in tabs):
+                    if self.foreground_component() == main:
+                        x, y = center(tuple(round(value) for value in profile[0]))
+                        self.tap((x, y + top))
+                        trace.record("recovery_profile_tab_tapped", point=(x, y + top))
+                        wait_for_page(self, vision, {"profile"}, timeout=8, trace=trace)
+                        return
+            time.sleep(0.5)
+        raise LandingUnconfirmed("重启后未确认Mgame的「我的」页面。")
 
 
 def check_size(image):
@@ -357,6 +432,8 @@ class Vision:
                 if y + 136 > 2350:
                     return "list", None
                 reward = self.match(image, self.task.row_reward, (180, y + 38, 575, y + 136))
+                if reward is None and self.task.key == "promo":
+                    reward = self.match(image, "promo_click_reward", (180, y + 38, 650, y + 136))
                 button = self.match(image, "go", (850, max(700, y - 12), 1030, y + 99))
                 if reward and button:
                     return "task", button
@@ -449,7 +526,7 @@ class Trace:
     def snapshot(self, phone, state, *, image=None, component=None):
         try:
             component = component if component is not None else phone.foreground_component()
-            image = phone.capture() if image is None else image
+            image = phone.capture(calibrated=False) if image is None else image
             self.screenshot_index += 1
             filename = f"screen-{self.screenshot_index:03d}-{state}.jpg"
             scaled = cv2.resize(image, None, fx=0.5, fy=0.5, interpolation=cv2.INTER_AREA)
@@ -505,6 +582,42 @@ def is_ranked_promo(image, trace):
     return bool(re.search(r"好评榜|人气榜|热销榜|排行榜", re.sub(r"\s+", "", title)))
 
 
+def promo_fullscreen_button(image, activity, trace):
+    if activity == PROMO_PORTRAIT_AD:
+        banner, button = (125, 50, 690, 141), (370, 1610, 710, 1740)
+        instruction, label = "app体验15秒", "了解更多"
+    elif activity == PROMO_VIDEO_AD:
+        banner, button = (25, 169, 448, 256), (430, 2130, 640, 2230)
+        instruction, label = "点击立得丰富奖励", "启动"
+    elif activity == PROMO_SIGMOB_AD:
+        banner, button = (290, 174, 616, 255), (400, 1478, 660, 1570)
+        instruction, label = "浏览6秒领取奖励", "立即前往"
+    else:
+        return None
+    text = read_ocr(trace, crop(image, banner), "promo-fullscreen-banner.png")
+    instruction_matches = instruction in re.sub(r"\s+", "", text).lower()
+    if instruction_matches:
+        text = read_ocr(trace, crop(image, button), "promo-fullscreen-button.png")
+        if re.sub(r"\s+", "", text) == label:
+            return button
+    if activity == PROMO_VIDEO_AD:
+        card = crop(image, (370, 1091, 710, 1556))
+        text = read_ocr(trace, card, "promo-video-end-card.png")
+        compact = re.sub(r"\s+", "", text)
+        if "启动" in compact and "重新播放" in compact and any(
+            app in compact for app in ("百度地图", "快手极速版")
+        ):
+            return PROMO_VIDEO_END_BUTTON
+    if instruction_matches and activity == PROMO_PORTRAIT_AD:
+        app = read_ocr(trace, crop(image, (440, 1900, 645, 1988)), "promo-fullscreen-app.png")
+        if re.sub(r"\s+", "", app) != "抖音":
+            return None
+        text = read_ocr(trace, crop(image, DOUYIN_OPEN_BUTTON), "promo-fullscreen-button.png")
+        if re.sub(r"\s+", "", text) == "点击打开或下载第三方应用":
+            return DOUYIN_OPEN_BUTTON
+    return None
+
+
 def close_ad_webview(phone, vision, image, trace):
     if phone.foreground_component() != [MGAME, AD_WEBVIEW]:
         return False
@@ -530,6 +643,7 @@ def wait_for_page(phone, vision, wanted, timeout=10, trace=None, *, settling=Fal
     entry_failed = False
     closed_webviews = 0
     returned_from_lock = False
+    qqlive_return_tapped = False
     while time.monotonic() < deadline:
         try:
             image = phone.frame()
@@ -541,6 +655,10 @@ def wait_for_page(phone, vision, wanted, timeout=10, trace=None, *, settling=Fal
                 returned_from_lock = True
                 wanted = wanted | {"ad"}
                 deadline = time.monotonic() + timeout
+            if settling and package == "com.tencent.qqlive" and not qqlive_return_tapped:
+                qqlive_return_tapped = tap_qqlive_return(phone, vision, trace)
+                if qqlive_return_tapped:
+                    deadline = time.monotonic() + timeout
             if "promo_landing" in wanted and package in PROMO_EXTERNAL_APPS:
                 return None, "promo_external", None
             time.sleep(0.45)
@@ -548,12 +666,15 @@ def wait_for_page(phone, vision, wanted, timeout=10, trace=None, *, settling=Fal
         except CaptureUnavailable:
             time.sleep(0.45)
             continue
-        if "ad" in wanted:
+        if "ad" in wanted and not entry_failed:
             failed = vision.match(image, "entry_failed", (290, 1090, 795, 1275), 0.87)
             if failed:
                 if trace:
                     save_image(trace.directory / "entry-failed.png", crop(image, failed))
+                    trace.record("entry_rejected")
                 entry_failed = True
+                # Give a late page transition time to arrive after the reported error.
+                deadline = min(deadline, time.monotonic() + 3)
         state, box = observe(image, vision, trace)
         if state == "unknown" and "promo_landing" in wanted:
             component = phone.foreground_component()
@@ -568,6 +689,9 @@ def wait_for_page(phone, vision, wanted, timeout=10, trace=None, *, settling=Fal
                 return image, "promo_lowprice", None
             elif component == [MGAME, PROMO_LIVE]:
                 return image, "promo_live", None
+            elif component[0] == MGAME and trace and component[1] in {PROMO_PORTRAIT_AD, PROMO_VIDEO_AD, PROMO_SIGMOB_AD}:
+                if promo_fullscreen_button(image, component[1], trace):
+                    return image, "promo_fullscreen_ad", None
             elif component == [MGAME, GAME_ACTIVITY] and vision.match(
                 image, "promo_farm", (121, 755, 620, 958)
             ):
@@ -594,6 +718,8 @@ def tap_verified(phone, vision, trace, expected, label="", progress=None):
     image = phone.frame()
     state, box = observe(image, vision, trace)
     if state != expected or box is None:
+        if expected == "task":
+            raise LandingUnconfirmed(f"点击前页面已变化：{state}。")
         raise Stop(f"点击前页面已变化：{state}。")
     if progress is not None and read_progress(image, vision, trace, f"{label}-before-tap") != progress:
         raise Stop("点击前任务进度已变化。")
@@ -613,9 +739,12 @@ def dismiss_ad(phone, vision, trace):
     trace.record("ad_dismissed")
 
 
-def find_task(phone, vision, trace, *, allow_missing=False):
-    image = phone.frame()
-    state, _ = vision.identify(image)
+def find_task(phone, vision, trace, *, allow_missing=False, page=None):
+    if page is None:
+        image = phone.frame()
+        state, _ = vision.identify(image)
+    else:
+        image, state, _ = page
     if state == "profile":
         tap_verified(phone, vision, trace, "profile")
         image, state, _ = wait_for_page(phone, vision, {"coins"})
@@ -624,8 +753,9 @@ def find_task(phone, vision, trace, *, allow_missing=False):
         listing = {"list", "task", "task_unavailable"}
         image, state, _ = wait_for_page(phone, vision, listing | {"reward", "reward_final"})
         if state not in listing:
-            dismiss_reward(phone, vision, trace)
-            image, state, _ = wait_for_page(phone, vision, listing)
+            _, (image, state, _) = dismiss_reward(phone, vision, trace)
+            if state not in listing:
+                image, state, _ = wait_for_page(phone, vision, listing)
     saw_top = False
     for down in (False, True):
         still = 0
@@ -659,8 +789,41 @@ def find_task(phone, vision, trace, *, allow_missing=False):
     raise Stop(f"未找到可执行的“{vision.task.name}”。")
 
 
-def browse_external(phone, vision, trace):
+def tap_qqlive_return(phone, vision, trace):
+    component = phone.foreground_component()
+    if component[0] != "com.tencent.qqlive":
+        return False
+    try:
+        image = phone.capture()
+    except CaptureUnavailable as exc:
+        trace.record("screenshot_unavailable", state="external-return", reason=str(exc))
+        return False
+    button = vision.match(image, "ad_external_return", (0, 1770, 406, 2290), 0.88)
+    if not button or phone.foreground_component() != component:
+        return False
+    phone.adb_call("shell", "input", "tap", *map(str, center(button)))
+    trace.snapshot(phone, "external-return", image=image, component=component)
+    return True
+
+
+def wait_for_landing_unlock(phone, trace, landing_apps, timeout):
+    trace.record("app_lock_wait", seconds=timeout)
+    print(f"广告落地页需要在手机上解锁，等待 {timeout} 秒。", flush=True)
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        package = phone.foreground()
+        if package in landing_apps:
+            trace.record("app_lock_unlocked", package=package)
+            return package
+        if package == MGAME:
+            break
+        time.sleep(0.5)
+    return APP_LOCK
+
+
+def browse_external(phone, vision, trace, *, seconds=None, unlock_timeout=0):
     landing_apps = LANDING_APPS | PROMO_EXTERNAL_APPS | GOODS_EXTERNAL_APPS
+    seconds = vision.task.seconds if seconds is None else seconds
     deadline = time.monotonic() + 10
     while time.monotonic() < deadline:
         package = phone.foreground()
@@ -676,24 +839,34 @@ def browse_external(phone, vision, trace):
         time.sleep(0.4)
     else:
         raise LandingUnconfirmed("未确认落地应用，无法开始计时。")
+    if package == APP_LOCK and unlock_timeout:
+        package = wait_for_landing_unlock(phone, trace, landing_apps, unlock_timeout)
+        unlock_timeout = 0
     started = time.monotonic()
     trace.record("landing", package=package)
     trace.snapshot(phone, "app-lock" if package == APP_LOCK else "external-landing")
     if package != APP_LOCK:
-        until = started + vision.task.seconds + 2
+        until = started + seconds + 2
         last_allowed = time.monotonic()
         while time.monotonic() < until:
             foreground = phone.foreground()
             if foreground == APP_LOCK:
-                package = APP_LOCK
-                break
+                if unlock_timeout:
+                    foreground = wait_for_landing_unlock(phone, trace, landing_apps, unlock_timeout)
+                    unlock_timeout = 0
+                if foreground == APP_LOCK:
+                    package = APP_LOCK
+                    break
+                package = foreground
+                last_allowed = time.monotonic()
+                until = last_allowed + seconds + 2
             if foreground == package:
                 last_allowed = time.monotonic()
             elif foreground in landing_apps:
                 trace.record("landing_changed", previous=package, package=foreground)
                 package = foreground
                 last_allowed = time.monotonic()
-                until = last_allowed + vision.task.seconds + 2
+                until = last_allowed + seconds + 2
             elif foreground is not None or time.monotonic() - last_allowed > 1.5:
                 raise LandingUnconfirmed(f"浏览期间前台应用变化：{foreground}。")
             time.sleep(0.35)
@@ -701,24 +874,12 @@ def browse_external(phone, vision, trace):
             raise LandingUnconfirmed("计时结束时广告落地页不在前台。")
     if package == APP_LOCK:
         trace.record("app_lock_return")
-    elif package == "com.tencent.qqlive":
-        try:
-            image = phone.capture()
-        except CaptureUnavailable as exc:
-            trace.record("screenshot_unavailable", state="external-return", reason=str(exc))
-            image = None
-        button = (vision.match(image, "ad_external_return", (0, 1770, 406, 2290), 0.88)
-                  if image is not None else None)
-        if button:
-            component = phone.foreground_component()
-            if component[0] == package:
-                phone.adb_call("shell", "input", "tap", *map(str, center(button)))
-                trace.snapshot(phone, "external-return", image=image, component=component)
-                deadline = time.monotonic() + 3
-                while time.monotonic() < deadline:
-                    if phone.foreground() == MGAME:
-                        return False
-                    time.sleep(0.35)
+    elif package == "com.tencent.qqlive" and tap_qqlive_return(phone, vision, trace):
+        deadline = time.monotonic() + 3
+        while time.monotonic() < deadline:
+            if phone.foreground() == MGAME:
+                return False
+            time.sleep(0.35)
     phone.return_to_mgame()
     return package == APP_LOCK
 
@@ -735,6 +896,21 @@ def browse_one(phone, vision, trace, before, progress):
         browse_promo_page(phone, vision, trace, page=state)
     elif state == "promo_external":
         locked = browse_external(phone, vision, trace)
+    elif state == "promo_fullscreen_ad":
+        component = phone.foreground_component()
+        if component[0] != MGAME:
+            raise LandingUnconfirmed("点击前全屏广告已离开前台。")
+        button = promo_fullscreen_button(phone.frame(), component[1], trace)
+        if button == DOUYIN_OPEN_BUTTON:
+            packages = phone.adb_call("shell", "pm", "list", "packages", DOUYIN_PACKAGE).decode().splitlines()
+            if f"package:{DOUYIN_PACKAGE}" not in packages:
+                raise LandingUnconfirmed("未找到已安装的抖音，无法打开广告落地应用。")
+        if not button or phone.foreground_component() != component:
+            raise LandingUnconfirmed("点击前无法确认全屏广告按钮。")
+        phone.tap(center(button))
+        trace.record("promo_fullscreen_tap", activity=component[1], point=center(button))
+        seconds = {PROMO_PORTRAIT_AD: 15, PROMO_SIGMOB_AD: 6}.get(component[1], vision.task.seconds)
+        locked = browse_external(phone, vision, trace, seconds=seconds, unlock_timeout=25)
     else:
         tap_verified(phone, vision, trace, "ad", label)
         locked = browse_external(phone, vision, trace)
@@ -827,19 +1003,19 @@ def browse_promo_page(phone, vision, trace, *, page="promo_landing"):
 
 def dismiss_reward(phone, vision, trace):
     image = phone.frame()
-    state, _ = vision.identify(image)
+    state, box = vision.identify(image)
     if state == "reward":
         close = vision.match(image, "reward_close", (110, 1490, 512, 1640), 0.87)
     elif state == "reward_final":
         close = vision.match(image, "reward_final", (390, 1525, 690, 1670))
     else:
-        return
+        return None, (image, state, box)
     if close is None:
         raise Stop("无法确认奖励弹窗的关闭按钮。")
     phone.tap(center(close))
     trace.record("reward_dismissed")
-    wait_for_page(phone, vision, {"coins", "list", "task", "task_unavailable"})
-    return state
+    page = wait_for_page(phone, vision, {"coins", "list", "task", "task_unavailable"})
+    return state, page
 
 
 def recover_ad_round(phone, vision, trace, failure):
@@ -869,11 +1045,12 @@ def recover_ad_round(phone, vision, trace, failure):
 
 
 def finish_task(phone, vision, trace, *, allow_missing=False):
-    if dismiss_reward(phone, vision, trace) == "reward_final":
+    dismissed, page = dismiss_reward(phone, vision, trace)
+    if dismissed == "reward_final" and sum(task.badge == vision.task.badge for task in TASKS) == 1:
         trace.record("task_complete", task=vision.task.key, evidence="final_reward_dialog")
         print("Mgame已显示最后一轮结算，剩余 0 轮。")
         return
-    frame = find_task(phone, vision, trace, allow_missing=allow_missing)
+    frame = find_task(phone, vision, trace, allow_missing=allow_missing, page=page)
     if frame is None:
         trace.record("task_not_listed", task=vision.task.key)
         print(f"全列表未显示“{vision.task.name}”，跳过。", flush=True)
@@ -884,7 +1061,7 @@ def finish_task(phone, vision, trace, *, allow_missing=False):
     for expected in range(done + 1, total + 1):
         last_round = expected == total
         before_count = timed_count(frame, trace, f"{vision.task.key}-{expected}-before") if last_round else None
-        for _ in range(4):
+        for attempt in range(4):
             try:
                 reward = browse_one(phone, vision, trace, frame, progress)
             except (LandingUnconfirmed, ForegroundChanged, CaptureUnavailable) as exc:
@@ -901,19 +1078,32 @@ def finish_task(phone, vision, trace, *, allow_missing=False):
                 break
             if refreshed != progress:
                 raise Stop(f"广告关闭后进度异常变化：{refreshed[0]}/{refreshed[1]}。")
+            if attempt == 1 and vision.task.key == "promo":
+                trace.record("promo_round_restarting", completed=refreshed[0], total=total)
+                phone.restart_mgame(vision, trace)
+                frame = find_task(phone, vision, trace, allow_missing=last_round)
+                if frame is None:
+                    break
+                refreshed = read_progress(frame, vision, trace, f"{vision.task.key}-restart-{expected}")
+                if refreshed == (expected, total):
+                    progress = refreshed
+                    reward = "progress_confirmed"
+                    break
+                if refreshed != progress:
+                    raise Stop(f"重启后进度异常变化：{refreshed[0]}/{refreshed[1]}。")
         else:
-            raise Stop("本轮尝试四次后仍未核对到结算。")
+            raise RoundUnsettled("本轮尝试四次后仍未核对到结算。")
         if reward == "progress_confirmed":
             print(f"恢复后已核对进度 {expected}/{total}。", flush=True)
             continue
         if reward is not None:
-            dismissed = dismiss_reward(phone, vision, trace)
+            dismissed, page = dismiss_reward(phone, vision, trace)
             if reward == "reward_final" or dismissed == "reward_final":
                 if not last_round:
                     raise Stop(f"Mgame已结束本组任务，上一轮进度为 {progress[0]}/{total}。")
                 print(f"最后一轮已结算，任务达到 {total}/{total}。", flush=True)
                 break
-            frame = find_task(phone, vision, trace, allow_missing=last_round)
+            frame = find_task(phone, vision, trace, allow_missing=last_round, page=page)
         if frame is None:
             after = phone.frame()
             after_count = timed_count(after, trace, f"{vision.task.key}-{expected}-after")
@@ -976,6 +1166,8 @@ def browse10_rows(vision, image, rule="browse10"):
     for y in rule_positions(vision, image, f"{rule}_rule", (182, 760, 420, 2345)):
         if y < 795 or y > 2310:
             continue
+        if rule == "browse10" and vision.match(image, TASKS[2].title, (175, y - 84, 565, y - 4)):
+            continue
         buttons = (840, y - 67, 1042, y + 34)
         claim = vision.match(image, "game60_claim", buttons)
         go = vision.match(image, "go", buttons)
@@ -1033,14 +1225,18 @@ def game_count(image, trace, tag):
     raise CountUnreadable("无法读取任务列表的领币次数。")
 
 
-def timed_count(image, trace, tag):
-    gray = cv2.cvtColor(crop(image, (87, 402, 160, 451)), cv2.COLOR_BGR2GRAY)
-    _, binary = cv2.threshold(gray, 175, 255, cv2.THRESH_BINARY_INV)
-    scaled = cv2.resize(binary, None, fx=3, fy=3, interpolation=cv2.INTER_LINEAR)
-    padded = cv2.copyMakeBorder(scaled, 20, 20, 20, 20, cv2.BORDER_CONSTANT, value=255)
-    value = read_ocr(trace, padded, f"timed-count-{tag}.png")
-    if re.fullmatch(r"\d{1,4}", value):
-        return int(value)
+def timed_count(image, trace, tag, *, alternate=False):
+    variants = [((85, 399, 166, 454), 2, 30, "-alternate")]
+    if not alternate:
+        variants.insert(0, ((87, 402, 160, 451), 3, 20, ""))
+    for region, scale, margin, suffix in variants:
+        gray = cv2.cvtColor(crop(image, region), cv2.COLOR_BGR2GRAY)
+        _, binary = cv2.threshold(gray, 175, 255, cv2.THRESH_BINARY_INV)
+        scaled = cv2.resize(binary, None, fx=scale, fy=scale, interpolation=cv2.INTER_LINEAR)
+        padded = cv2.copyMakeBorder(scaled, margin, margin, margin, margin, cv2.BORDER_CONSTANT, value=255)
+        value = read_ocr(trace, padded, f"timed-count-{tag}{suffix}.png")
+        if re.fullmatch(r"\d{1,4}", value):
+            return int(value)
     return game_count(image, trace, tag)
 
 
@@ -1055,6 +1251,14 @@ def confirm_reward_count(capture, trace, tag, before, reward, timeout):
             after = timed_count(image, trace, f"{tag}-{attempt}")
         except CountUnreadable:
             after = None
+        if after is not None and after not in {before, expected}:
+            try:
+                alternate = timed_count(image, trace, f"{tag}-{attempt}-recheck", alternate=True)
+            except CountUnreadable:
+                alternate = None
+            trace.record("reward_count_ocr_recheck", check=tag, attempt=attempt, observed=after, alternate=alternate)
+            if alternate == expected:
+                return image, alternate
         if after == expected:
             return image, after
         trace.record("reward_count_retry", check=tag, attempt=attempt, expected=expected, observed=after)
@@ -1065,17 +1269,23 @@ def confirm_reward_count(capture, trace, tag, before, reward, timeout):
 
 def game60_panel(phone, vision, trace):
     listing = {"list", "task", "task_unavailable"}
+    rewards = {"reward", "reward_final"}
     entrance = {"profile", "coins"} | listing
-    image, state, _ = wait_for_page(phone, vision, entrance | {"reward", "reward_final"}, timeout=15)
-    if state in {"reward", "reward_final"}:
-        dismiss_reward(phone, vision, trace)
-        image, state, _ = wait_for_page(phone, vision, entrance)
+    image, state, _ = wait_for_page(phone, vision, entrance | rewards, timeout=15)
+    if state in rewards:
+        _, (image, state, _) = dismiss_reward(phone, vision, trace)
+        if state not in entrance:
+            image, state, _ = wait_for_page(phone, vision, entrance)
     if state == "profile":
         tap_verified(phone, vision, trace, "profile")
         _, state, _ = wait_for_page(phone, vision, {"coins"})
     if state == "coins":
         tap_verified(phone, vision, trace, "coins")
-        image, _, _ = wait_for_page(phone, vision, listing)
+        image, state, _ = wait_for_page(phone, vision, listing | rewards)
+        if state in rewards:
+            _, (image, state, _) = dismiss_reward(phone, vision, trace)
+            if state not in listing:
+                image, _, _ = wait_for_page(phone, vision, listing)
     trace.record("game60_panel_open")
     return image
 
@@ -1181,6 +1391,8 @@ def play_game60(phone, vision, trace, seconds=GAME_WAIT_SECONDS):
     phone.return_to_mgame()
     try:
         image = return_game60_panel(phone, vision, trace)
+    except DeviceDisconnected:
+        raise
     except Stop as exc:
         trace.record("game60_recovery", reason=str(exc))
         trace.snapshot(phone, "game-restore")
@@ -1630,6 +1842,174 @@ def tap_browse10_row(phone, vision, trace, icon, action, reward, rule="browse10"
     return before
 
 
+def app_jump_title(image, vision):
+    return vision.match(image, "app_jump_title", (175, 700, 620, 2320))
+
+
+def find_app_jump_list(phone, vision, image):
+    for down in (False, True):
+        for _ in range(19):
+            title = app_jump_title(image, vision)
+            if title and title[1] <= 1580:
+                return image, title
+            if title or down:
+                if vision.match(image, "list_end", (410, 1770, 716, 2320)):
+                    return None
+                phone.scroll(True)
+            else:
+                if vision.match(image, "list_top", (178, 700, 475, 1000)):
+                    break
+                phone.scroll(False)
+            time.sleep(0.4)
+            image = phone.frame()
+            if not vision.match(image, "panel", (270, 555, 800, 688)):
+                raise LandingUnconfirmed("扫描期间已离开加次数任务列表。")
+    raise Stop("未能确认跳转登录 APP 的任务区域。")
+
+
+def app_jump_progress(image, title, trace, index):
+    _, top, right, bottom = title
+    text = read_ocr(trace, crop(image, (right, top - 10, right + 160, bottom + 10)),
+                    f"app-jump-progress-{index}.png")
+    match = re.search(r"(?<!\d)([0-8])[/／]8(?!\d)", re.sub(r"\s+", "", text))
+    if match is None:
+        raise CountUnreadable("未识别到跳转登录 APP 的 0–8 项进度。")
+    return int(match[1])
+
+
+def app_jump_cards(image, title, vision, trace, index):
+    top = title[1] + 108
+    area = (175, top, 1045, min(2320, title[1] + 715))
+    result = read_ocr(trace, crop(image, area), f"app-jump-cards-{index}.png", layout=True)
+    cards = {}
+    for line in json.loads(result):
+        label = re.sub(r"\s+", "", line["text"])
+        for name, package in APP_JUMP_TARGETS.items():
+            if name not in label and not (name == "猫耳FM" and "猫FM" in label):
+                continue
+            x, y = (round(value) for value in line["box"][:2])
+            left = 454 if x + area[0] < 620 else 876
+            y += top
+            region = (left, y - 10, left + 160, min(y + 75, 2330))
+            claim = vision.match(image, "app_jump_claim", region, 0.88, competing="app_jump_go")
+            go = vision.match(image, "app_jump_go", region, 0.88, competing="app_jump_claim")
+            if claim:
+                pixels = crop(image, claim)
+                orange = (pixels[:, :, 2] > 190) & (pixels[:, :, 1] < 160) & (pixels[:, :, 0] < 100)
+                if np.mean(orange) > 0.18:
+                    cards[package] = name, "claim", claim
+            elif go:
+                cards[package] = name, "go", go
+    return cards
+
+
+def visit_app_jump(phone, trace, package):
+    deadline = time.monotonic() + 8
+    opened = False
+    since = None
+    elapsed = False
+    while time.monotonic() < deadline:
+        foreground = phone.foreground()
+        if foreground == APP_LOCK:
+            trace.record("app_jump_app_lock", package=package)
+            break
+        now = time.monotonic()
+        if foreground == package:
+            if since is None:
+                since = now
+            if not opened:
+                opened = True
+                deadline = now + 2 * APP_JUMP_WAIT_SECONDS + 5
+                trace.record("app_jump_opened", package=package)
+            if now - since >= APP_JUMP_WAIT_SECONDS:
+                elapsed = True
+                trace.record("app_jump_visit_elapsed", package=package, seconds=APP_JUMP_WAIT_SECONDS)
+                trace.snapshot(phone, "app-jump-after-wait")
+                if phone.foreground() != package:
+                    break
+                phone.adb_call("shell", "input", "keyevent", "KEYCODE_BACK")
+                return_deadline = time.monotonic() + 2
+                while time.monotonic() < return_deadline:
+                    if phone.foreground() == MGAME:
+                        trace.record("app_jump_returned_by_back", package=package)
+                        return True
+                    time.sleep(0.35)
+                break
+        elif since is not None:
+            since = None
+            trace.record("app_jump_visit_interrupted", package=package, foreground=foreground)
+        time.sleep(0.35)
+    else:
+        trace.record("app_jump_visit_unconfirmed", package=package, opened=opened)
+    if phone.foreground() != MGAME:
+        phone.return_to_mgame()
+    return elapsed
+
+
+def finish_app_jump(phone, vision, trace, attempted):
+    installed = set(phone.adb_call("shell", "pm", "list", "packages").decode().splitlines())
+    previous = None
+    pending = None
+    visited = False
+    for index in range(17):
+        for refresh in range(3):
+            image = game60_panel(phone, vision, trace)
+            result = find_app_jump_list(phone, vision, image)
+            if result is None:
+                if previous is None:
+                    trace.record("app_jump_not_listed")
+                    print("当前列表未显示跳转登录 APP 的任务组。", flush=True)
+                    return
+                raise Stop("跳转登录 APP 任务已移出列表，未核对最终进度。")
+            image, title = result
+            sample = f"{index}-{refresh}" if refresh else index
+            completed = app_jump_progress(image, title, trace, sample)
+            if completed == 8:
+                break
+            cards = app_jump_cards(image, title, vision, trace, sample)
+            candidates = [(package, name, action) for package, (name, action, _) in cards.items()
+                          if (package, action) not in attempted]
+            if candidates or pending is None or refresh == 2:
+                break
+            trace.record("app_jump_settlement_wait", package=pending, progress=completed)
+            time.sleep(1.5)
+        if previous is not None and completed < previous:
+            raise Stop(f"跳转登录 APP 进度异常回退：{previous}/8 → {completed}/8。")
+        if pending is not None:
+            trace.record("app_jump_result", package=pending, before=previous, after=completed)
+        trace.record("app_jump_progress", completed=completed, total=8)
+        if completed == 8:
+            print("跳转登录 APP 任务已核对完成 8/8。", flush=True)
+            return
+        if not candidates:
+            message = f"跳转登录 APP 已核对到 {completed}/8，本轮没有新奖励可领取或未尝试的已识别入口。"
+            if visited:
+                raise RoundUnsettled(message)
+            raise Stop(message)
+        package, name, action = min(candidates, key=lambda card: card[2] != "claim")
+        previous, pending = completed, package
+        if action == "go" and f"package:{package}" not in installed:
+            attempted.add((package, action))
+            trace.record("app_jump_missing_app", package=package)
+            continue
+        fresh = phone.frame()
+        fresh_title = app_jump_title(fresh, vision)
+        if not fresh_title:
+            raise LandingUnconfirmed("点击前跳转登录 APP 的任务组已离开当前画面。")
+        verified = app_jump_cards(fresh, fresh_title, vision, trace, f"{index}-before-tap").get(package)
+        if not verified or verified[1] != action:
+            raise LandingUnconfirmed(f"点击前未能重新确认{name}的入口状态。")
+        box = verified[2]
+        print(f"跳转登录 APP {completed}/8 · {name}", flush=True)
+        phone.tap(center(box))
+        trace.record("app_jump_tap", package=package, action=action, point=center(box))
+        if action == "go" and visit_app_jump(phone, trace, package):
+            visited = True
+        attempted.add((package, action))
+        time.sleep(1)
+    raise Stop("跳转登录 APP 达到单次执行上限。")
+
+
 def run_stages(phone, trace, task_key, visions, settled):
     stages = [(vision.task.key, vision.task.name, vision) for vision in visions]
     if task_key in {"all", "games"}:
@@ -1637,7 +2017,11 @@ def run_stages(phone, trace, task_key, visions, settled):
     for rule, label in TIMED_LABELS.items():
         if task_key in {"all", rule} or (task_key == "timed" and rule != "browse10"):
             stages.append((rule, label, Vision(TASKS[2])))
+    if task_key == "appjump":
+        stages.append(("appjump", "跳转登录 APP 领奖励", Vision()))
 
+    deferred_promo = False
+    app_jump_attempted = set()
     for number, (key, label, vision) in enumerate(stages, start=1):
         trace.stage = key
         started = time.monotonic()
@@ -1645,23 +2029,49 @@ def run_stages(phone, trace, task_key, visions, settled):
         trace.record("stage_started", stage=key, number=number, total=len(stages))
         trace.snapshot(phone, "stage-start")
         recoveries = 0
+        deferred = False
+        app_jump_restarted = False
         if key not in settled:
             for attempt in range(3):
                 try:
                     if key == "games":
                         finish_games(phone, vision, trace)
+                    elif key == "appjump":
+                        finish_app_jump(phone, vision, trace, app_jump_attempted)
                     elif key in TIMED_SECONDS:
                         finish_browse10(phone, vision, trace, key)
                     else:
-                        finish_task(phone, vision, trace, allow_missing=True)
+                        finish_task(phone, vision, trace, allow_missing=not (key == "promo" and deferred_promo))
                     break
-                except (ForegroundChanged, CaptureUnavailable, LandingUnconfirmed, CountUnreadable) as exc:
+                except RoundUnsettled as exc:
+                    if key == "appjump" and not app_jump_restarted and attempt < 2:
+                        app_jump_restarted = True
+                        recoveries += 1
+                        trace.record("app_jump_restart_mgame", reason=str(exc))
+                        print("跳转奖励暂未刷新，重开美团后重新核对。", flush=True)
+                        phone.restart_mgame(vision, trace)
+                        continue
+                    if task_key != "all" or key != "promo" or deferred_promo:
+                        raise
+                    deferred_promo = deferred = True
+                    stages.append((key, label, vision))
+                    trace.record("stage_deferred", reason=str(exc))
+                    print("优惠活动暂未结算，先完成后续阶段，最后再补试。", flush=True)
+                    break
+                except (ForegroundChanged, CaptureUnavailable, LandingUnconfirmed, CountUnreadable, DeviceDisconnected) as exc:
                     if attempt == 2:
                         raise
                     recoveries += 1
                     trace.record("stage_recovery", attempt=attempt + 1, reason=str(exc))
+                    if isinstance(exc, DeviceDisconnected):
+                        trace.record("usb_reconnect_wait")
+                        print("USB 调试连接中断，正在等待原手机重新上线。", flush=True)
+                        phone.wait_for_usb()
+                        trace.record("usb_reconnected")
                     trace.snapshot(phone, "stage-recovery")
                     phone.recover_mgame_main(vision, trace)
+        if deferred:
+            continue
         trace.snapshot(phone, "stage-end")
         trace.record("stage_finished", stage=key, recoveries=recoveries,
                      elapsed_seconds=round(time.monotonic() - started, 1))
@@ -1750,7 +2160,7 @@ def main():
     mode.add_argument("--return-mgame", action="store_true", help="从手机桌面和最近任务返回Mgame主界面")
     mode.add_argument("--open-game-center", action="store_true", help="返回并通过游戏中心链接进入首页")
     parser.add_argument("--serial", help="ADB USB 真机序列号，省略时选择唯一已授权的真机")
-    parser.add_argument("--task", choices=("all", *(task.key for task in TASKS), "games", *TIMED_SECONDS, "timed"), default="all")
+    parser.add_argument("--task", choices=("all", *(task.key for task in TASKS), "games", *TIMED_SECONDS, "timed", "appjump"), default="all")
     args = parser.parse_args()
 
     trace = None
@@ -1791,8 +2201,8 @@ def main():
                         wait_for_page(phone, vision, {"coins", "list", "task", "task_unavailable"})
                         break
                     if state in {"reward", "reward_final"}:
-                        same_reward = [item for item in visions if item.task.badge == vision.task.badge]
-                        if dismiss_reward(phone, vision, trace) == "reward_final" and len(same_reward) == 1:
+                        dismissed, _ = dismiss_reward(phone, vision, trace)
+                        if dismissed == "reward_final" and sum(task.badge == vision.task.badge for task in TASKS) == 1:
                             trace.record("task_complete", task=vision.task.key, evidence="final_reward_dialog")
                             settled.add(vision.task.key)
                         break
@@ -1800,6 +2210,14 @@ def main():
             else:
                 image = load_image(args.image) if args.image else phone.frame()
                 check_size(image)
+                if args.task == "appjump":
+                    vision = Vision(TASKS[2])
+                    title = app_jump_title(image, vision)
+                    if not title:
+                        raise Stop("当前画面未显示跳转登录 APP 的任务组。")
+                    completed = app_jump_progress(image, title, trace, 0)
+                    print(f"当前跳转登录 APP 进度 {completed}/8。")
+                    return 0
                 if args.task in {"games", *TIMED_SECONDS, "timed"}:
                     vision = Vision()
                     rules = ("play20", "listen30", "watch60") if args.task == "timed" else (args.task,)

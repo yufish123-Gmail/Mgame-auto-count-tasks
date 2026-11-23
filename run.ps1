@@ -4,7 +4,7 @@ param(
     [switch]$OpenGameCenter,
     [string]$Image,
     [string]$Serial,
-    [ValidateSet('all', 'page', 'goods', 'promo', 'games', 'browse10', 'play20', 'listen30', 'watch60', 'timed')][string]$Task = 'all',
+    [ValidateSet('all', 'page', 'goods', 'promo', 'games', 'browse10', 'play20', 'listen30', 'watch60', 'timed', 'appjump')][string]$Task = 'all',
     [string]$Python
 )
 
