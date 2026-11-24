@@ -26,6 +26,7 @@ APP_LOCK = "com.miui.securitycenter"
 PROMO_ACTIVITY = "com.meituan.android.knb.core.StandardKnbActivity"
 PROMO_SEARCH = MGAME + ".search.result.SearchResultActivity"
 PROMO_WEBVIEW = "com.sankuai.titans.adapter.mtapp.KNBWebViewActivity"
+VERIFICATION_ACTIVITY = "com.meituan.android.yoda.activity.YodaRouterTransparentActivity"
 PROMO_LIVE = "com.dianping.live.live.mrn.MLiveMRNActivity"
 PROMO_GROUP = "com.meituan.android.mtgb.business.main.MTGMainActivity"
 PROMO_ATTRACTION = "com.meituan.traveltools.mrncontainer.HTMRNBaseActivity"
@@ -37,7 +38,9 @@ DOUYIN_PACKAGE = "com.ss.android.ugc.aweme"
 DOUYIN_OPEN_BUTTON = (215, 2120, 870, 2230)
 PROMO_VIDEO_END_BUTTON = (433, 1325, 647, 1434)
 PROMO_EXTERNAL_APPS = {"com.dianping.v1"}
-GOODS_EXTERNAL_APPS = {"com.qiyi.video", "com.UCMobile", "com.tencent.qqlive", DOUYIN_PACKAGE, "com.ss.android.article.lite"}
+GOODS_EXTERNAL_APPS = {
+    "com.qiyi.video", "com.UCMobile", "com.tencent.qqlive", DOUYIN_PACKAGE, "com.ss.android.article.lite", "cn.missevan",
+}
 GAME_ACTIVITY = "com.meituan.android.mgc.container.MGCGameActivity"
 GAME_AD = "com.windmill.sdk.widget.InterstitialView_4012001"
 GAME_AD_COMPACT = "com.windmill.sdk.widget.InterstitialView_4012003"
@@ -88,6 +91,10 @@ class Stop(RuntimeError):
 
 
 class RoundUnsettled(Stop):
+    pass
+
+
+class VerificationRequired(Stop):
     pass
 
 
@@ -301,6 +308,11 @@ class Phone:
         deadline = time.monotonic() + 8
         while self.foreground_component() != main:
             if time.monotonic() >= deadline:
+                if self.foreground_component() in GAME_COMPONENTS:
+                    trace.snapshot(self, "stuck-game-before-restart")
+                    trace.record("recovery_stuck_game_restart")
+                    self.restart_mgame(vision, trace)
+                    break
                 raise Stop("切换后未确认Mgame主界面已打开。")
             time.sleep(0.4)
         trace.record("recovery_main_confirmed")
@@ -483,6 +495,13 @@ def read_progress(image, vision, trace, label):
     enlarged = cv2.resize(gray, None, fx=3, fy=3, interpolation=cv2.INTER_CUBIC)
     _, binary = cv2.threshold(enlarged, 0, 255, cv2.THRESH_BINARY | cv2.THRESH_OTSU)
     padded = cv2.copyMakeBorder(binary, 20, 20, 20, 20, cv2.BORDER_CONSTANT, value=255)
+    previous = trace.last_progress
+    if previous is not None:
+        task, pixels, done, total, source = previous
+        if task == vision.task.key and np.array_equal(pixels, padded):
+            trace.record("progress", completed=done, total=total, ocr_reused_from=source)
+            return done, total
+    source = path.name
     output = read_ocr(trace, padded, path.name)
     values = re.findall(r"(?<!\d)(\d{1,2})\s*[/／]\s*(\d{1,2})(?!\d)", output)
     values = [value for value in values if 0 <= int(value[0]) <= int(value[1]) <= 30 and int(value[1]) > 0]
@@ -494,7 +513,8 @@ def read_progress(image, vision, trace, label):
             for scale in (0.75, 1.0, 0.5):
                 resized = cv2.resize(tight, None, fx=scale, fy=scale, interpolation=cv2.INTER_AREA)
                 retry = cv2.copyMakeBorder(resized, 30, 30, 30, 30, cv2.BORDER_CONSTANT, value=255)
-                output = read_ocr(trace, retry, f"progress-{label}-retry-{scale}.png")
+                source = f"progress-{label}-retry-{scale}.png"
+                output = read_ocr(trace, retry, source)
                 values = re.findall(r"(?<!\d)(\d{1,2})\s*[/／]\s*(\d{1,2})(?!\d)", output)
                 values = [value for value in values if 0 <= int(value[0]) <= int(value[1]) <= 30 and int(value[1]) > 0]
                 if len(values) == 1:
@@ -504,6 +524,7 @@ def read_progress(image, vision, trace, label):
     done, total = map(int, values[0])
     if not 0 <= done <= total <= 30 or total == 0:
         raise Stop(f"无法确认任务进度 {done}/{total}。")
+    trace.last_progress = (vision.task.key, padded, done, total, source)
     trace.record("progress", completed=done, total=total)
     return done, total
 
@@ -514,6 +535,7 @@ class Trace:
         self.directory.mkdir(parents=True)
         self.stage = None
         self.screenshot_index = 0
+        self.last_progress = None
         self.record("start", mode=mode)
 
     def record(self, event, **fields):
@@ -740,6 +762,8 @@ def dismiss_ad(phone, vision, trace):
 
 
 def find_task(phone, vision, trace, *, allow_missing=False, page=None):
+    listing = {"list", "task", "task_unavailable"}
+    rewards = {"reward", "reward_final"}
     if page is None:
         image = phone.frame()
         state, _ = vision.identify(image)
@@ -750,16 +774,16 @@ def find_task(phone, vision, trace, *, allow_missing=False, page=None):
         image, state, _ = wait_for_page(phone, vision, {"coins"})
     if state == "coins":
         tap_verified(phone, vision, trace, "coins")
-        listing = {"list", "task", "task_unavailable"}
-        image, state, _ = wait_for_page(phone, vision, listing | {"reward", "reward_final"})
-        if state not in listing:
-            _, (image, state, _) = dismiss_reward(phone, vision, trace)
-            if state not in listing:
-                image, state, _ = wait_for_page(phone, vision, listing)
+        image, state, _ = wait_for_page(phone, vision, listing | rewards)
     saw_top = False
     for down in (False, True):
         still = 0
         for step in range(17):
+            if state in rewards:
+                trace.snapshot(phone, "list-late-reward", image=image)
+                _, (image, state, _) = dismiss_reward(phone, vision, trace)
+                if state not in listing:
+                    image, state, _ = wait_for_page(phone, vision, listing)
             if state in {"task", "task_unavailable"}:
                 return image
             if state != "list":
@@ -1447,6 +1471,8 @@ def return_game60_panel(phone, vision, trace):
     if phone.foreground_component() != [MGAME, GAME_ACTIVITY]:
         return game60_panel(phone, vision, trace)
     phone.tap(center(button))
+    trace.record("game60_exit_tap", point=center(button))
+    trace.snapshot(phone, "game-exit-control", image=image, component=[MGAME, GAME_ACTIVITY])
     image, _, _ = wait_for_page(phone, vision, listing, timeout=8)
     trace.record("game60_return")
     return image
@@ -1534,6 +1560,10 @@ def browse10_landing(phone, vision, trace):
     deadline = time.monotonic() + 18
     while time.monotonic() < deadline:
         component = phone.foreground_component()
+        if component == [MGAME, VERIFICATION_ACTIVITY]:
+            trace.snapshot(phone, "verification-required", component=component)
+            trace.record("verification_required", activity=component[1])
+            raise VerificationRequired("浏览任务要求在手机上完成验证，待人工处理后再继续。")
         if component[0] == MGAME:
             try:
                 image = phone.frame()
@@ -1633,12 +1663,15 @@ def timed_media(phone, vision, trace, rule):
     deadline = time.monotonic() + seconds
     trace.snapshot(phone, rule + "-playing")
     print(f"已打开播放页，前台停留 {seconds} 秒。", flush=True)
-    while time.monotonic() < deadline:
-        if phone.foreground_component() not in players:
-            raise Stop("计时期间播放页离开前台。")
+    while True:
+        component = phone.foreground_component()
+        if component not in players:
+            trace.snapshot(phone, rule + "-interrupted", component=component)
+            trace.record("timed_media_interrupted", rule=rule, component=component)
+            raise LandingUnconfirmed("计时期间播放页离开前台，需重新确认本阶段。")
+        if time.monotonic() >= deadline:
+            break
         time.sleep(0.5)
-    if phone.foreground_component() not in players:
-        raise Stop("计时结束时播放页已离开前台。")
     trace.record("timed_media_completed", rule=rule, seconds=seconds)
     phone.back()
     if listening:
@@ -2021,6 +2054,7 @@ def run_stages(phone, trace, task_key, visions, settled):
         stages.append(("appjump", "跳转登录 APP 领奖励", Vision()))
 
     deferred_promo = False
+    deferred_verification = False
     app_jump_attempted = set()
     for number, (key, label, vision) in enumerate(stages, start=1):
         trace.stage = key
@@ -2042,6 +2076,15 @@ def run_stages(phone, trace, task_key, visions, settled):
                         finish_browse10(phone, vision, trace, key)
                     else:
                         finish_task(phone, vision, trace, allow_missing=not (key == "promo" and deferred_promo))
+                    break
+                except VerificationRequired as exc:
+                    if task_key != "all" or key != "browse10" or deferred_verification:
+                        raise
+                    deferred_verification = deferred = True
+                    stages.append((key, label, vision))
+                    trace.record("stage_deferred", reason=str(exc))
+                    print("浏览任务需要人工验证，先完成后续阶段，最后再打开待处理项。", flush=True)
+                    phone.recover_mgame_main(vision, trace)
                     break
                 except RoundUnsettled as exc:
                     if key == "appjump" and not app_jump_restarted and attempt < 2:

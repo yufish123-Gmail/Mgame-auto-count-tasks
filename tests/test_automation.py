@@ -1,4 +1,5 @@
 import unittest
+from pathlib import Path
 from subprocess import CompletedProcess
 from unittest.mock import MagicMock, patch
 
@@ -32,6 +33,52 @@ class AutomationTests(unittest.TestCase):
         self.phone.recover_mgame_main.assert_called_once_with(second, self.trace)
         finished = [call.kwargs for call in self.trace.record.call_args_list if call.args[0] == "stage_finished"]
         self.assertEqual([entry["recoveries"] for entry in finished], [0, 1])
+
+    def test_progress_skips_ocr_only_when_fresh_pixels_and_task_match(self):
+        self.trace.directory = Path("runs")
+        self.trace.last_progress = None
+        self.vision.task_title.return_value = (35, 20, 100, 40)
+        image = helper.np.full((80, 300, 3), 255, dtype=helper.np.uint8)
+        image[24:34, 117:123] = 0
+        changed = image.copy()
+        changed[30:39, 125:131] = 0
+        with patch.object(helper, "read_ocr", side_effect=["1/5", "2/5", "2/10"]) as ocr:
+            self.assertEqual(helper.read_progress(image, self.vision, self.trace, "settled"), (1, 5))
+            self.assertEqual(helper.read_progress(image.copy(), self.vision, self.trace, "before-tap"), (1, 5))
+            self.assertEqual(helper.read_progress(changed, self.vision, self.trace, "changed"), (2, 5))
+            self.vision.task = helper.TASKS[1]
+            self.assertEqual(helper.read_progress(changed, self.vision, self.trace, "other-task"), (2, 10))
+        self.assertEqual(ocr.call_count, 3)
+        self.trace.record.assert_any_call("progress", completed=1, total=5, ocr_reused_from="progress-settled.png")
+
+    def test_find_task_handles_reward_that_appeared_after_recovery(self):
+        popup, task_page = object(), object()
+        self.phone.frame.return_value = popup
+        self.vision.identify.return_value = ("reward", None)
+        with patch.object(helper, "dismiss_reward", return_value=("reward", (task_page, "task", None))):
+            self.assertIs(helper.find_task(self.phone, self.vision, self.trace), task_page)
+        self.trace.snapshot.assert_called_once_with(self.phone, "list-late-reward", image=popup)
+        self.phone.scroll.assert_not_called()
+
+    def test_browse_verification_stops_without_input_or_retry(self):
+        component = [helper.MGAME, helper.VERIFICATION_ACTIVITY]
+        self.phone.foreground_component.return_value = component
+        with self.assertRaises(helper.Stop) as failure:
+            helper.browse10_landing(self.phone, self.vision, self.trace)
+        self.assertNotIsInstance(failure.exception, helper.LandingUnconfirmed)
+        self.trace.snapshot.assert_called_once_with(self.phone, "verification-required", component=component)
+        self.phone.tap.assert_not_called()
+        self.phone.back.assert_not_called()
+
+    def test_game_still_foreground_after_main_recovery_gets_one_restart(self):
+        clock = Clock()
+        self.phone.home.return_value = "launcher"
+        self.phone.foreground.side_effect = ["launcher", helper.MGAME]
+        self.phone.foreground_component.return_value = [helper.MGAME, helper.GAME_ACTIVITY]
+        with patch.object(helper, "time", clock):
+            helper.Phone.recover_mgame_main(self.phone, self.vision, self.trace)
+        self.phone.restart_mgame.assert_called_once_with(self.vision, self.trace)
+        self.trace.record.assert_any_call("recovery_stuck_game_restart")
 
     def test_recovery_stops_after_three_stage_attempts(self):
         with patch.object(helper, "finish_task", side_effect=helper.LandingUnconfirmed("unknown")) as finish:
@@ -137,6 +184,22 @@ class AutomationTests(unittest.TestCase):
         self.assertFalse(finish.call_args.kwargs["allow_missing"])
         self.trace.record.assert_any_call("stage_deferred", reason="promo")
         self.trace.record.assert_called_with("all_stages_finished")
+
+    def test_full_run_handles_independent_stages_before_handing_off_verification(self):
+        calls = []
+
+        def finish_timed(phone, vision, trace, rule):
+            calls.append(rule)
+            if rule == "browse10":
+                raise helper.VerificationRequired("manual verification")
+
+        with patch.object(helper, "finish_games"), patch.object(helper, "finish_browse10", side_effect=finish_timed):
+            with self.assertRaises(helper.VerificationRequired):
+                helper.run_stages(self.phone, self.trace, "all", [], set())
+
+        self.assertEqual(calls, ["browse10", "play20", "listen30", "watch60", "browse10"])
+        self.phone.recover_mgame_main.assert_called_once()
+        self.assertFalse(any(call.args[0] == "all_stages_finished" for call in self.trace.record.call_args_list))
 
     def test_consecutive_webviews_are_closed(self):
         self.phone.frame.side_effect = ["store", "error", "reward"]
@@ -383,8 +446,9 @@ class AutomationTests(unittest.TestCase):
         # Even if saving a screenshot takes the whole wait, verify the final component.
         self.trace.snapshot.side_effect = lambda *args, **kwargs: setattr(clock, "now", 63)
         with patch.object(helper, "time", clock):
-            with self.assertRaises(helper.Stop):
+            with self.assertRaises(helper.LandingUnconfirmed):
                 helper.timed_media(self.phone, self.vision, self.trace, "watch60")
+        self.trace.record.assert_any_call("timed_media_interrupted", rule="watch60", component=[helper.MGAME, "changed"])
         self.assertFalse(any(call.args[0] == "timed_media_completed" for call in self.trace.record.call_args_list))
         self.phone.back.assert_not_called()
 
