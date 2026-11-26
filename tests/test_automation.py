@@ -425,6 +425,17 @@ class AutomationTests(unittest.TestCase):
         self.assertEqual(clock.waits, [59])
         self.phone.return_to_mgame.assert_called_once()
 
+    def test_game_foreground_retry_does_not_count_interruption(self):
+        game = [helper.MGAME, helper.GAME_ACTIVITY]
+        ad = [helper.MGAME, helper.GAME_AD]
+        self.phone.foreground_component.side_effect = [game, game, ad]
+        with patch.object(helper, "time", Clock()), patch.object(helper, "return_game60_panel") as close:
+            with self.assertRaises(helper.LandingUnconfirmed):
+                helper.play_game60(self.phone, self.vision, self.trace, seconds=70, foreground=True)
+        self.phone.home.assert_not_called()
+        close.assert_not_called()
+        self.assertFalse(any(call.args[0] == "game60_timer_elapsed" for call in self.trace.record.call_args_list))
+
     def test_media_screenshot_time_counts_toward_wait(self):
         clock = Clock()
         self.phone.foreground_component.return_value = [helper.MGAME, helper.TIMED_PLAYERS["listen30"][0]]

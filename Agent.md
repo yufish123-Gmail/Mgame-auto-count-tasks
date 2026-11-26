@@ -40,6 +40,13 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\run.ps1 -OpenGameCenter
 
 ## 优化日志
 
+### 2026-11-26
+
+- `Vision` 先确认优惠活动标题，再在同一行匹配「浏览 5 秒得 +3」的小字和按钮。`browse_one` 从点击前的同一帧读取时长，传给站内落地页计时。日志中的 `landing.duration=7` 表示 5 秒要求加 2 秒余量。普通优惠广告弹窗仍按 10 秒要求留足时间，全屏广告沿用各版式的计时规则。
+- `finish_games` 在后台计时后先找同一游戏的「可领奖」。仍找不到时，只有重新核对到同一行的「去完成」才补跑一次前台。检查 `game60_foreground_retry`、`game60_foreground_started` 和 `game60_timer_elapsed` 的 `mode=foreground`，最终用 `game60_confirmed` 核对 +3。前台组件切换时不记录计时完成。
+- 本轮通过程序单独前台补跑百货城，70 秒后核对 112 → 115。日常入口从后台失败自动切换到前台的完整路径仍待回测。微博已加入好物广告落地页列表，尚待该广告再次出现时验证新识别分支。
+- 8 个阶段分段结算，最终 140 次，总耗时 37 分 02 秒。比较耗时时保留首次启动、恢复与续跑之间的时间，并核对当天任务数量。37 项离线测试通过，日志目录和最终截图见 [项目状态](项目状态.md#2026-11-26-真机效率回测)。
+
 ### 2026-11-22
 
 优化以 Python 程序自主执行和恢复为主。直接入口为 `python coin_helper.py --execute --task all`，也兼容既有 `run.ps1` 和 CMD 入口。解释器需安装 requirements.txt 中的依赖。本机已创建项目 `.venv` 并安装依赖，可用 `.\.venv\Scripts\python.exe` 直接执行或由启动器自动选取。11 月 21 日使用的相邻环境路径保留作历史记录。

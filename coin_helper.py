@@ -39,7 +39,8 @@ DOUYIN_OPEN_BUTTON = (215, 2120, 870, 2230)
 PROMO_VIDEO_END_BUTTON = (433, 1325, 647, 1434)
 PROMO_EXTERNAL_APPS = {"com.dianping.v1"}
 GOODS_EXTERNAL_APPS = {
-    "com.qiyi.video", "com.UCMobile", "com.tencent.qqlive", DOUYIN_PACKAGE, "com.ss.android.article.lite", "cn.missevan",
+    "com.qiyi.video", "com.UCMobile", "com.tencent.qqlive", DOUYIN_PACKAGE,
+    "com.ss.android.article.lite", "cn.missevan", "com.sina.weibo",
 }
 GAME_ACTIVITY = "com.meituan.android.mgc.container.MGCGameActivity"
 GAME_AD = "com.windmill.sdk.widget.InterstitialView_4012001"
@@ -47,6 +48,7 @@ GAME_AD_COMPACT = "com.windmill.sdk.widget.InterstitialView_4012003"
 GAME60_AD_COMPONENTS = ([MGAME, GAME_AD], [MGAME, GAME_AD_COMPACT])
 GAME_COMPONENTS = ([MGAME, GAME_ACTIVITY], *GAME60_AD_COMPONENTS)
 GAME_WAIT_SECONDS = 62
+GAME_FOREGROUND_RETRY_SECONDS = GAME_WAIT_SECONDS + 8
 APP_JUMP_WAIT_SECONDS = 10
 APP_JUMP_TARGETS = {
     "百度极速版": "com.baidu.searchbox.lite",
@@ -401,6 +403,16 @@ class Vision:
     def task_title(self, image):
         return self.match(image, self.task.title, (175, 705, 565, 2300))
 
+    def promo_five_second_reward(self, image, title_y):
+        return self.match(image, "good_task_reward", (180, title_y + 38, 575, title_y + 136))
+
+    def task_wait_seconds(self, image):
+        if self.task.key == "promo":
+            title = self.task_title(image)
+            if title and self.promo_five_second_reward(image, title[1]):
+                return 5
+        return self.task.seconds
+
     def promo_button(self, image, trace):
         # Require the observed ad dialog layout, then read its instruction.
         close = self.match(image, "ad_close", (479, 1675, 603, 1890))
@@ -413,7 +425,7 @@ class Vision:
         if float(np.mean(yellow)) < 0.70:
             return None
         text = read_ocr(trace, pixels, "promo-ad-button.png")
-        if re.sub(r"\s+", "", text) != "点击并浏览10秒领奖励":
+        if not re.fullmatch(r"点击并浏览(?:5|10)秒领奖励", re.sub(r"\s+", "", text)):
             return None
         return region
 
@@ -445,7 +457,9 @@ class Vision:
                     return "list", None
                 reward = self.match(image, self.task.row_reward, (180, y + 38, 575, y + 136))
                 if reward is None and self.task.key == "promo":
-                    reward = self.match(image, "promo_click_reward", (180, y + 38, 650, y + 136))
+                    reward = self.promo_five_second_reward(image, y) or self.match(
+                        image, "promo_click_reward", (180, y + 38, 650, y + 136)
+                    )
                 button = self.match(image, "go", (850, max(700, y - 12), 1030, y + 99))
                 if reward and button:
                     return "task", button
@@ -748,6 +762,7 @@ def tap_verified(phone, vision, trace, expected, label="", progress=None):
     trace.evidence(image, state, box, f"click-{state}{label}.png")
     trace.record("tap", state=state, point=center(box))
     phone.tap(center(box))
+    return image
 
 
 def dismiss_ad(phone, vision, trace):
@@ -910,16 +925,17 @@ def browse_external(phone, vision, trace, *, seconds=None, unlock_timeout=0):
 
 def browse_one(phone, vision, trace, before, progress):
     label = f"-{vision.task.key}-{progress[0] + 1}"
-    tap_verified(phone, vision, trace, "task", label, progress)
+    task_frame = tap_verified(phone, vision, trace, "task", label, progress)
+    seconds = vision.task_wait_seconds(task_frame)
     wanted = {"ad", "promo_landing"}
     landing, state, _ = wait_for_page(phone, vision, wanted, timeout=18, trace=trace)
     if landing is not None:
         trace.snapshot(phone, state, image=landing)
     locked = False
     if state in {"promo_landing", "promo_travel", "promo_live", "promo_farm", "promo_attraction", "promo_rank", "promo_lowprice"}:
-        browse_promo_page(phone, vision, trace, page=state)
+        browse_promo_page(phone, vision, trace, page=state, seconds=seconds)
     elif state == "promo_external":
-        locked = browse_external(phone, vision, trace)
+        locked = browse_external(phone, vision, trace, seconds=seconds)
     elif state == "promo_fullscreen_ad":
         component = phone.foreground_component()
         if component[0] != MGAME:
@@ -933,11 +949,13 @@ def browse_one(phone, vision, trace, before, progress):
             raise LandingUnconfirmed("点击前无法确认全屏广告按钮。")
         phone.tap(center(button))
         trace.record("promo_fullscreen_tap", activity=component[1], point=center(button))
-        seconds = {PROMO_PORTRAIT_AD: 15, PROMO_SIGMOB_AD: 6}.get(component[1], vision.task.seconds)
+        seconds = {PROMO_PORTRAIT_AD: 15, PROMO_SIGMOB_AD: 6}.get(component[1], seconds)
         locked = browse_external(phone, vision, trace, seconds=seconds, unlock_timeout=25)
     else:
         tap_verified(phone, vision, trace, "ad", label)
-        locked = browse_external(phone, vision, trace)
+        # The ad dialog can independently require up to ten seconds.
+        seconds = max(seconds, 10) if vision.task.key == "promo" else seconds
+        locked = browse_external(phone, vision, trace, seconds=seconds)
     wanted = {"reward", "reward_final"}
     if locked:
         wanted.add("ad")
@@ -985,8 +1003,9 @@ def close_promo_live(phone, vision, trace):
     raise LandingUnconfirmed("无法确认直播页关闭按钮。")
 
 
-def browse_promo_page(phone, vision, trace, *, page="promo_landing"):
-    trace.record("landing", page=page, duration=vision.task.seconds + 2)
+def browse_promo_page(phone, vision, trace, *, page="promo_landing", seconds=None):
+    duration = (vision.task.seconds if seconds is None else seconds) + 2
+    trace.record("landing", page=page, duration=duration)
     activity = {
         "promo_travel": PROMO_WEBVIEW, "promo_live": PROMO_LIVE, "promo_farm": GAME_ACTIVITY,
         "promo_attraction": PROMO_ATTRACTION,
@@ -994,7 +1013,7 @@ def browse_promo_page(phone, vision, trace, *, page="promo_landing"):
     }.get(page)
     if page == "promo_rank":
         activity = phone.foreground_component()[1]
-    deadline = time.monotonic() + vision.task.seconds + 2
+    deadline = time.monotonic() + duration
     while True:
         if activity:
             on_page = phone.foreground_component() == [MGAME, activity]
@@ -1392,27 +1411,40 @@ def leave_game60_ad(phone, vision, trace):
     raise Stop("点击关闭后未回到游戏。请手动返回。")
 
 
-def play_game60(phone, vision, trace, seconds=GAME_WAIT_SECONDS):
+def play_game60(phone, vision, trace, seconds=GAME_WAIT_SECONDS, *, foreground=False):
+    activities = ([MGAME, GAME_ACTIVITY],) if foreground else GAME_COMPONENTS
     deadline = time.monotonic() + 45
-    while phone.foreground_component() not in GAME_COMPONENTS:
+    while phone.foreground_component() not in activities:
         if time.monotonic() >= deadline:
             raise Stop("未能确认游戏打开。")
         time.sleep(0.5)
 
     trace.snapshot(phone, "game-open")
-    launcher = phone.home()
-    deadline = time.monotonic() + 5
-    while phone.foreground() != launcher:
-        if time.monotonic() >= deadline:
-            raise Stop("按 Home 后未确认回到手机桌面。")
-        time.sleep(0.4)
-    trace.record("game60_background_started", seconds=seconds)
-    deadline = time.monotonic() + seconds
-    trace.snapshot(phone, "game-desktop")
-    print(f"已回到手机桌面，等待 {seconds} 秒后切回Mgame。", flush=True)
-    time.sleep(max(0, deadline - time.monotonic()))
-    trace.record("game60_timer_elapsed", seconds=seconds, mode="background")
-    phone.return_to_mgame()
+    if foreground:
+        trace.record("game60_foreground_started", seconds=seconds)
+        print(f"游戏前台补跑，等待 {seconds} 秒。", flush=True)
+        deadline = time.monotonic() + seconds
+        while True:
+            if phone.foreground_component() not in activities:
+                raise LandingUnconfirmed("游戏前台补跑期间页面切换，未确认计时。")
+            if time.monotonic() >= deadline:
+                break
+            time.sleep(0.5)
+        trace.record("game60_timer_elapsed", seconds=seconds, mode="foreground")
+    else:
+        launcher = phone.home()
+        deadline = time.monotonic() + 5
+        while phone.foreground() != launcher:
+            if time.monotonic() >= deadline:
+                raise Stop("按 Home 后未确认回到手机桌面。")
+            time.sleep(0.4)
+        trace.record("game60_background_started", seconds=seconds)
+        deadline = time.monotonic() + seconds
+        trace.snapshot(phone, "game-desktop")
+        print(f"已回到手机桌面，等待 {seconds} 秒后切回Mgame。", flush=True)
+        time.sleep(max(0, deadline - time.monotonic()))
+        trace.record("game60_timer_elapsed", seconds=seconds, mode="background")
+        phone.return_to_mgame()
     try:
         image = return_game60_panel(phone, vision, trace)
     except DeviceDisconnected:
@@ -1496,10 +1528,11 @@ def same_game60(image, candidates, title, action):
     return matching[0]
 
 
-def finish_games(phone, vision, trace):
+def finish_games(phone, vision, trace, *, foreground=False):
+    seconds = GAME_FOREGROUND_RETRY_SECONDS if foreground else GAME_WAIT_SECONDS
     component = phone.foreground_component()
     if component in GAME_COMPONENTS:
-        image = play_game60(phone, vision, trace)
+        image = play_game60(phone, vision, trace, seconds=seconds, foreground=foreground)
     else:
         if component[0] != MGAME:
             phone.recover_mgame_main(vision, trace)
@@ -1517,8 +1550,17 @@ def finish_games(phone, vision, trace):
             fresh = phone.frame()
             _, _, box = same_game60(fresh, game60_rows(vision, fresh), selected, "go")
             phone.tap(center(box))
-            image = play_game60(phone, vision, trace)
+            image = play_game60(phone, vision, trace, seconds=seconds, foreground=foreground)
             image, row = scan_game60(phone, vision, image, "claim", title=selected)
+            if row is None and not foreground:
+                image, row = scan_game60(phone, vision, image, "either", title=selected)
+                if row is not None and row[1] == "go":
+                    trace.record("game60_foreground_retry")
+                    fresh = phone.frame()
+                    _, _, box = same_game60(fresh, game60_rows(vision, fresh), selected, "go")
+                    phone.tap(center(box))
+                    image = play_game60(phone, vision, trace, seconds=GAME_FOREGROUND_RETRY_SECONDS, foreground=True)
+                    image, row = scan_game60(phone, vision, image, "claim", title=selected)
             if row is None:
                 raise Stop("停留后没有看到“可领奖”，未确认游戏任务完成。")
         else:
@@ -2043,7 +2085,7 @@ def finish_app_jump(phone, vision, trace, attempted):
     raise Stop("跳转登录 APP 达到单次执行上限。")
 
 
-def run_stages(phone, trace, task_key, visions, settled):
+def run_stages(phone, trace, task_key, visions, settled, *, foreground_games=False):
     stages = [(vision.task.key, vision.task.name, vision) for vision in visions]
     if task_key in {"all", "games"}:
         stages.append(("games", "玩 60 秒得 +3", Vision()))
@@ -2069,7 +2111,7 @@ def run_stages(phone, trace, task_key, visions, settled):
             for attempt in range(3):
                 try:
                     if key == "games":
-                        finish_games(phone, vision, trace)
+                        finish_games(phone, vision, trace, foreground=foreground_games)
                     elif key == "appjump":
                         finish_app_jump(phone, vision, trace, app_jump_attempted)
                     elif key in TIMED_SECONDS:
