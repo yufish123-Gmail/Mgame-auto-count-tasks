@@ -27,6 +27,9 @@ PROMO_ACTIVITY = "com.meituan.android.knb.core.StandardKnbActivity"
 PROMO_SEARCH = MGAME + ".search.result.SearchResultActivity"
 PROMO_WEBVIEW = "com.sankuai.titans.adapter.mtapp.KNBWebViewActivity"
 VERIFICATION_ACTIVITY = "com.meituan.android.yoda.activity.YodaRouterTransparentActivity"
+BROWSE_VERIFICATION_ACTIVITIES = {
+    VERIFICATION_ACTIVITY, "com.meituan.android.yoda.activity.YodaConfirmActivity",
+}
 PROMO_LIVE = "com.dianping.live.live.mrn.MLiveMRNActivity"
 PROMO_GROUP = "com.meituan.android.mtgb.business.main.MTGMainActivity"
 PROMO_ATTRACTION = "com.meituan.traveltools.mrncontainer.HTMRNBaseActivity"
@@ -41,6 +44,7 @@ PROMO_EXTERNAL_APPS = {"com.dianping.v1"}
 GOODS_EXTERNAL_APPS = {
     "com.qiyi.video", "com.UCMobile", "com.tencent.qqlive", DOUYIN_PACKAGE,
     "com.ss.android.article.lite", "cn.missevan", "com.sina.weibo",
+    "com.quark.browser", "com.taobao.idlefish",
 }
 GAME_ACTIVITY = "com.meituan.android.mgc.container.MGCGameActivity"
 GAME_AD = "com.windmill.sdk.widget.InterstitialView_4012001"
@@ -483,14 +487,23 @@ def center(box):
     return ((box[0] + box[2]) // 2, (box[1] + box[3]) // 2)
 
 
-def read_ocr(trace, image, filename, *, layout=False):
+def read_ocr(trace, image, filename, *, layout=False, reuse=False):
     path = trace.directory / filename
+    if reuse:
+        previous = trace.ocr_samples.get(filename)
+        if previous is not None and previous[0] == layout and np.array_equal(previous[1], image):
+            trace.record("ocr_reused", file=filename)
+            return previous[2]
+    trace.ocr_samples.pop(filename, None)
     save_image(path, image)
     arguments = ("-Layout",) if layout else ()
     data = run_command("powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass",
                        "-File", str(ROOT / "read-progress.ps1"), "-Image", str(path), *arguments,
                        tool="Windows OCR")
-    return data.decode("utf-8", errors="replace").strip()
+    result = data.decode("utf-8", errors="replace").strip()
+    if reuse:
+        trace.ocr_samples[filename] = (layout, image.copy(), result)
+    return result
 
 
 def read_progress(image, vision, trace, label):
@@ -550,6 +563,7 @@ class Trace:
         self.stage = None
         self.screenshot_index = 0
         self.last_progress = None
+        self.ocr_samples = {}
         self.record("start", mode=mode)
 
     def record(self, event, **fields):
@@ -1333,7 +1347,7 @@ def game60_panel(phone, vision, trace):
     return image
 
 
-def scan_game60(phone, vision, image, state, title=None, *, rule=None, exclude=()):
+def scan_game60(phone, vision, image, state, title=None, *, rule=None, exclude=(), exclude_go=()):
     for down in (False, True):
         still = 0
         for _ in range(20):
@@ -1341,7 +1355,8 @@ def scan_game60(phone, vision, image, state, title=None, *, rule=None, exclude=(
                 rows = browse10_rows(vision, image, rule) if rule else game60_rows(vision, image)
                 if rule:
                     rows = (row for row in rows if (title is None or matches_browse10(image, row[0], title))
-                            and not any(matches_browse10(image, row[0], icon) for icon in exclude))
+                            and not any(matches_browse10(image, row[0], icon) for icon in exclude)
+                            and (row[1] != "go" or not any(matches_browse10(image, row[0], icon) for icon in exclude_go)))
                 else:
                     rows = (row for row in rows if title is None or matches_game60_title(image, row, title))
                 if state == "either":
@@ -1602,7 +1617,7 @@ def browse10_landing(phone, vision, trace):
     deadline = time.monotonic() + 18
     while time.monotonic() < deadline:
         component = phone.foreground_component()
-        if component == [MGAME, VERIFICATION_ACTIVITY]:
+        if component[0] == MGAME and component[1] in BROWSE_VERIFICATION_ACTIVITIES:
             trace.snapshot(phone, "verification-required", component=component)
             trace.record("verification_required", activity=component[1])
             raise VerificationRequired("浏览任务要求在手机上完成验证，待人工处理后再继续。")
@@ -1662,30 +1677,67 @@ def leave_browse10_month(phone, vision, trace):
     raise Stop("关闭活动浮层后未确认返回入口。")
 
 
-def confirm_browse10_review_exit(phone, vision, trace):
+def browse10_review_exit_button(image, vision, trace):
+    prompt_region = (330, 1092, 734, 1215)
+    leave_region = (190, 1380, 495, 1480)
+    dialog = vision.match(image, "browse10_review_prompt", prompt_region)
+    button = vision.match(image, "browse10_review_leave", leave_region)
+    if dialog and button:
+        return button
+    if not vision.match(image, "browse10_review", (380, 122, 710, 216)):
+        return None
+    title = read_ocr(trace, crop(image, prompt_region), "browse10-review-exit-title.png", reuse=True)
+    title = re.sub(r"\s+", "", title)
+    if title.rstrip("?？") != "确认要离开吗":
+        return None
+    label = read_ocr(trace, crop(image, leave_region), "browse10-review-exit-button.png", reuse=True)
+    return leave_region if re.sub(r"\s+", "", label) == "确认离开" else None
+
+
+def is_browse10_review_home(image, vision, trace):
+    if vision.match(image, "browse10_review_home", (350, 1470, 730, 1720)):
+        return True
+    if not vision.match(image, "browse10_review", (380, 122, 710, 216)):
+        return False
+    text = read_ocr(trace, crop(image, (388, 1498, 704, 1589)), "browse10-review-home.png", reuse=True)
+    return re.sub(r"\s+", "", text) == "开始评审"
+
+
+def confirm_browse10_review_exit(phone, vision, trace, *, resume_image=None):
+    activity = [MGAME, PROMO_ACTIVITY]
+    if resume_image is not None:
+        if phone.foreground_component() != activity:
+            return
+        if is_browse10_review_home(resume_image, vision, trace):
+            if phone.foreground_component() == activity:
+                phone.back()
+            return
+        if not browse10_review_exit_button(resume_image, vision, trace) and phone.foreground_component() == activity:
+            phone.back()
+
     deadline = time.monotonic() + 6
     while time.monotonic() < deadline:
-        if phone.foreground_component() != [MGAME, PROMO_ACTIVITY]:
+        if phone.foreground_component() != activity:
             return
         image = phone.frame()
-        dialog = vision.match(image, "browse10_review_prompt", (330, 1092, 734, 1215))
-        button = vision.match(image, "browse10_review_leave", (190, 1380, 495, 1480))
-        if dialog and button:
+        button = browse10_review_exit_button(image, vision, trace)
+        if button and phone.foreground_component() == activity:
             phone.tap(center(button))
             trace.record("browse10_review_exit_confirmed")
             break
         time.sleep(0.5)
     else:
-        raise Stop("未确认评审团的离开按钮。")
+        raise LandingUnconfirmed("未确认评审团的离开按钮。")
     deadline = time.monotonic() + 6
     while time.monotonic() < deadline:
-        if phone.foreground_component() != [MGAME, PROMO_ACTIVITY]:
+        if phone.foreground_component() != activity:
             return
-        if vision.match(phone.frame(), "browse10_review_home", (370, 1564, 708, 1695)):
-            phone.back()
+        if is_browse10_review_home(phone.frame(), vision, trace):
+            if phone.foreground_component() == activity:
+                phone.back()
             return
         time.sleep(0.5)
-    raise Stop("未确认评审团首页已加载。")
+    raise LandingUnconfirmed("未确认评审团首页已加载。")
 
 
 def timed_media(phone, vision, trace, rule):
@@ -1826,7 +1878,7 @@ def leave_novel_audio(phone, vision):
     raise Stop("未能确认小说章节预览或书库的返回入口。")
 
 
-def finish_browse10(phone, vision, trace, rule="browse10"):
+def finish_browse10(phone, vision, trace, rule="browse10", *, continue_after_verification=False):
     if rule == "listen30":
         ad_seen = close_novel_ad(phone, vision, trace)
         if ad_seen and phone.foreground_component() == [MGAME, MGAME + ".msv.page.activity.MSVPageActivity"]:
@@ -1837,7 +1889,11 @@ def finish_browse10(phone, vision, trace, rule="browse10"):
     else:
         if rule == "browse10":
             image = phone.frame()
-            if (not close_share_dialog(phone, vision, trace, image)
+            if (phone.foreground_component() == [MGAME, PROMO_ACTIVITY]
+                    and vision.match(image, "browse10_review", (380, 122, 710, 216))):
+                trace.snapshot(phone, "resume-review", image=image)
+                confirm_browse10_review_exit(phone, vision, trace, resume_image=image)
+            elif (not close_share_dialog(phone, vision, trace, image)
                 and vision.identify(image)[0] == "unknown" and is_store_detail(image, trace)):
                 trace.snapshot(phone, "resume-store", image=image)
                 phone.back()
@@ -1846,15 +1902,22 @@ def finish_browse10(phone, vision, trace, rule="browse10"):
             leave_drama(phone)
         image = game60_panel(phone, vision, trace)
     completed = []
+    pending = []
     launch_failures = 0
     moved_attempts = 0
     for index in range(20):
-        image, row = scan_game60(phone, vision, image, "either", rule=rule, exclude=completed)
+        image, row = scan_game60(phone, vision, image, "either", rule=rule, exclude=completed, exclude_go=tuple(pending))
         if row is None:
+            if pending:
+                trace.record("timed_verification_pending", rule=rule, confirmed=len(completed), pending=len(pending))
+                raise VerificationRequired(f"本次完成 {len(completed)} 项，仍有 {len(pending)} 项需要在手机上验证。")
             trace.record("timed_no_remaining", rule=rule, confirmed=len(completed))
             print(f"已扫到列表底部，本次完成 {len(completed)} 项 {TIMED_SECONDS[rule]} 秒任务。", flush=True)
             return
         y, action, _ = row
+        pending_claim = None
+        if action == "claim":
+            pending_claim = next((i for i, saved in enumerate(pending) if matches_browse10(image, y, saved)), None)
         icon = browse10_key(image, y).copy()
         reward = browse10_reward(image, y, vision, trace, rule)
         try:
@@ -1870,6 +1933,18 @@ def finish_browse10(phone, vision, trace, rule="browse10"):
                 if row is None:
                     raise Stop("浏览后原任务未显示可领奖，未确认完成。")
                 before = tap_browse10_row(phone, vision, trace, icon, "claim", reward, rule)
+        except VerificationRequired:
+            if not continue_after_verification or rule != "browse10":
+                raise
+            pending.append(icon)
+            filename = f"browse10-verification-row-{index + 1}.png"
+            save_image(trace.directory / filename, icon)
+            trace.record("timed_verification_deferred", rule=rule, reward=reward, file=filename)
+            print("该浏览项需要人工验证，先核对同阶段其他任务。", flush=True)
+            phone.recover_mgame_main(vision, trace)
+            image = game60_panel(phone, vision, trace)
+            launch_failures = moved_attempts = 0
+            continue
         except TaskRowMoved:
             moved_attempts += 1
             if moved_attempts >= 3:
@@ -1888,6 +1963,8 @@ def finish_browse10(phone, vision, trace, rule="browse10"):
             lambda: game60_panel(phone, vision, trace), trace, f"{rule}-{index}-after", before, reward, timeout=10,
         )
         completed.append(icon)
+        if pending_claim is not None:
+            del pending[pending_claim]
         launch_failures = 0
         moved_attempts = 0
         trace.record("timed_confirmed", rule=rule, before=before, after=after, reward=reward)
@@ -2115,7 +2192,10 @@ def run_stages(phone, trace, task_key, visions, settled, *, foreground_games=Fal
                     elif key == "appjump":
                         finish_app_jump(phone, vision, trace, app_jump_attempted)
                     elif key in TIMED_SECONDS:
-                        finish_browse10(phone, vision, trace, key)
+                        finish_browse10(
+                            phone, vision, trace, key,
+                            continue_after_verification=key == "browse10" and deferred_verification,
+                        )
                     else:
                         finish_task(phone, vision, trace, allow_missing=not (key == "promo" and deferred_promo))
                     break

@@ -61,12 +61,13 @@ class AutomationTests(unittest.TestCase):
         self.phone.scroll.assert_not_called()
 
     def test_browse_verification_stops_without_input_or_retry(self):
-        component = [helper.MGAME, helper.VERIFICATION_ACTIVITY]
-        self.phone.foreground_component.return_value = component
-        with self.assertRaises(helper.Stop) as failure:
-            helper.browse10_landing(self.phone, self.vision, self.trace)
-        self.assertNotIsInstance(failure.exception, helper.LandingUnconfirmed)
-        self.trace.snapshot.assert_called_once_with(self.phone, "verification-required", component=component)
+        for activity in helper.BROWSE_VERIFICATION_ACTIVITIES:
+            with self.subTest(activity=activity):
+                component = [helper.MGAME, activity]
+                self.phone.foreground_component.return_value = component
+                with self.assertRaises(helper.VerificationRequired):
+                    helper.browse10_landing(self.phone, self.vision, self.trace)
+                self.trace.snapshot.assert_called_with(self.phone, "verification-required", component=component)
         self.phone.tap.assert_not_called()
         self.phone.back.assert_not_called()
 
@@ -188,8 +189,8 @@ class AutomationTests(unittest.TestCase):
     def test_full_run_handles_independent_stages_before_handing_off_verification(self):
         calls = []
 
-        def finish_timed(phone, vision, trace, rule):
-            calls.append(rule)
+        def finish_timed(phone, vision, trace, rule, *, continue_after_verification=False):
+            calls.append((rule, continue_after_verification))
             if rule == "browse10":
                 raise helper.VerificationRequired("manual verification")
 
@@ -197,9 +198,96 @@ class AutomationTests(unittest.TestCase):
             with self.assertRaises(helper.VerificationRequired):
                 helper.run_stages(self.phone, self.trace, "all", [], set())
 
-        self.assertEqual(calls, ["browse10", "play20", "listen30", "watch60", "browse10"])
+        self.assertEqual(calls, [("browse10", False), ("play20", False), ("listen30", False),
+                                 ("watch60", False), ("browse10", True)])
         self.phone.recover_mgame_main.assert_called_once()
         self.assertFalse(any(call.args[0] == "all_stages_finished" for call in self.trace.record.call_args_list))
+
+    def test_browse_verification_is_cleared_only_by_the_same_row_settlement(self):
+        for same_row in (False, True):
+            with self.subTest(same_row=same_row):
+                self.trace.reset_mock()
+                self.check_browse_verification_settlement(same_row)
+
+    def check_browse_verification_settlement(self, same_row):
+        blocked_key, ready_key = MagicMock(), MagicMock()
+        blocked, ready = (800, "go", None), (900, "claim", None)
+        self.trace.directory = Path("runs")
+        with (
+            patch.object(helper, "close_share_dialog", return_value=False),
+            patch.object(helper, "game60_panel", return_value="list"),
+            patch.object(helper, "scan_game60", side_effect=[("list", blocked), ("list", ready), ("list", None)]) as scan,
+            patch.object(helper, "browse10_key", side_effect=[blocked_key, ready_key]),
+            patch.object(helper, "matches_browse10", return_value=same_row),
+            patch.object(helper, "browse10_reward", return_value=2),
+            patch.object(helper, "tap_browse10_row", side_effect=[None, 100]),
+            patch.object(helper, "browse10_landing", side_effect=helper.VerificationRequired("manual")),
+            patch.object(helper, "confirm_reward_count", return_value=("list", 102)),
+            patch.object(helper, "save_image"),
+        ):
+            if same_row:
+                helper.finish_browse10(self.phone, self.vision, self.trace, continue_after_verification=True)
+            else:
+                with self.assertRaises(helper.VerificationRequired):
+                    helper.finish_browse10(self.phone, self.vision, self.trace, continue_after_verification=True)
+
+        self.assertEqual(scan.call_args_list[1].kwargs["exclude_go"], (blocked_key.copy.return_value,))
+        if same_row:
+            self.trace.record.assert_any_call("timed_no_remaining", rule="browse10", confirmed=1)
+        else:
+            self.trace.record.assert_any_call("timed_verification_pending", rule="browse10", confirmed=1, pending=1)
+            self.assertFalse(any(call.args[0] == "timed_no_remaining" for call in self.trace.record.call_args_list))
+
+    def test_pending_browse_row_blocks_go_but_allows_confirmed_claim(self):
+        blocked_go, blocked_claim, other_go = (800, "go", None), (800, "claim", None), (900, "go", None)
+        with (
+            patch.object(helper, "matches_browse10", side_effect=lambda image, y, icon: y == icon),
+            patch.object(helper, "browse10_rows", side_effect=[[blocked_go, other_go], [blocked_claim, other_go]]),
+        ):
+            _, first = helper.scan_game60(self.phone, self.vision, "list", "either", rule="browse10", exclude_go=[800])
+            _, second = helper.scan_game60(self.phone, self.vision, "list", "either", rule="browse10", exclude_go=[800])
+        self.assertEqual(first, other_go)
+        self.assertEqual(second, blocked_claim)
+
+    def test_review_ocr_reuses_only_unchanged_pixels_and_output_mode(self):
+        self.trace.directory = Path("runs")
+        self.trace.ocr_samples = {}
+        image = helper.np.zeros((10, 10), dtype=helper.np.uint8)
+        with (
+            patch.object(helper, "save_image") as save,
+            patch.object(helper, "run_command", side_effect=[b"first", b"changed", b"layout"]) as command,
+        ):
+            self.assertEqual(helper.read_ocr(self.trace, image, "sample.png", reuse=True), "first")
+            self.assertEqual(helper.read_ocr(self.trace, image.copy(), "sample.png", reuse=True), "first")
+            image[0, 0] = 1
+            self.assertEqual(helper.read_ocr(self.trace, image, "sample.png", reuse=True), "changed")
+            self.assertEqual(helper.read_ocr(self.trace, image, "sample.png", reuse=True, layout=True), "layout")
+        self.assertEqual(command.call_count, 3)
+        self.assertEqual(save.call_count, 3)
+        self.trace.record.assert_called_once_with("ocr_reused", file="sample.png")
+
+    def test_review_exit_ocr_requires_exact_left_button(self):
+        self.vision.match.side_effect = lambda image, name, *_: (410, 140, 665, 195) if name == "browse10_review" else None
+        image = helper.np.zeros((1480, 740, 3), dtype=helper.np.uint8)
+        with patch.object(helper, "read_ocr", side_effect=["确认要离开吗？", "确认 离开"]):
+            self.assertEqual(helper.browse10_review_exit_button(image, self.vision, self.trace), (190, 1380, 495, 1480))
+        with patch.object(helper, "read_ocr", side_effect=["确认要离开吗？", "继续评审"]):
+            self.assertIsNone(helper.browse10_review_exit_button(image, self.vision, self.trace))
+
+    def test_review_exit_timeouts_can_recover_without_sending_an_extra_back(self):
+        self.phone.foreground_component.return_value = [helper.MGAME, helper.PROMO_ACTIVITY]
+        for button in (None, (190, 1380, 495, 1480)):
+            with (
+                self.subTest(button=button),
+                patch.object(helper, "time", Clock()),
+                patch.object(helper, "browse10_review_exit_button", return_value=button),
+                patch.object(helper, "is_browse10_review_home", return_value=False),
+            ):
+                self.phone.reset_mock()
+                with self.assertRaises(helper.LandingUnconfirmed):
+                    helper.confirm_browse10_review_exit(self.phone, self.vision, self.trace)
+                self.assertEqual(self.phone.tap.call_count, int(button is not None))
+                self.phone.back.assert_not_called()
 
     def test_consecutive_webviews_are_closed(self):
         self.phone.frame.side_effect = ["store", "error", "reward"]
